@@ -42,6 +42,7 @@ use crate::crypto::{Hash, aggsig, signature};
 use crate::network::{Network, NetworkError, NetworkMessage};
 use crate::repair::{Repair, RepairMessage};
 use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shred, Shredder, Slice};
+use crate::shredder;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
 pub use blockstore::{BlockInfo, Blockstore};
@@ -52,20 +53,21 @@ pub use vote::Vote;
 use votor::Votor;
 
 /// Number of slots in each leader window.
-pub const SLOTS_PER_WINDOW: u64 = 4;
+pub const SLOTS_PER_WINDOW: u64 = 1;
 /// Number of slots in each epoch.
 pub const SLOTS_PER_EPOCH: u64 = 18_000;
 /// Time bound assumed on network transmission delays during periods of synchrony.
-const DELTA: Duration = Duration::from_millis(400);
+const DELTA: Duration = Duration::from_millis(10_000);
+/// Target time for block production (slot length)
+const TARGET_BLOCK_TIME: Duration = Duration::from_millis(180_000);
 /// Time the leader has for producing and sending the block.
-const DELTA_BLOCK: Duration = Duration::from_millis(400);
+const DELTA_BLOCK: Duration = Duration::from_millis(360_000);
 /// Timeout to use when we haven't seen any shred from the leader's block.
-/// This is used to skip honest but crashed leaders faster.
-const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(800);
+const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(540_000);
 /// Timeout to use when we have seen at least one shred from the leader's block.
-const DELTA_TIMEOUT: Duration = Duration::from_millis(1200);
+const DELTA_TIMEOUT: Duration = Duration::from_millis(720_000);
 /// Timeout for standstill detection mechanism.
-const DELTA_STANDSTILL: Duration = Duration::from_millis(10_000);
+const DELTA_STANDSTILL: Duration = Duration::from_millis(900_000);
 
 /// Alpenglow consensus protocol implementation.
 pub struct Alpenglow<A: All2All, D: Disseminator, R: Network> {
@@ -346,11 +348,11 @@ where
         let ph = &hex::encode(parent_hash)[..8];
         info!("producing block in slot {slot} with parent {ph} in slot {parent_slot}",);
 
-        // TODO: send actual data
         for slice_index in 0..1 {
             let start_time = Instant::now();
-            let mut data = vec![0; MAX_DATA_PER_SLICE];
-            rng.fill_bytes(&mut data);
+            let min_len = 40;
+            let padded_len = ((min_len + shredder::DATA_SHREDS - 1) / shredder::DATA_SHREDS) * shredder::DATA_SHREDS;
+            let mut data = vec![0u8; padded_len]; // pad to next multiple of DATA_SHREDS
             // pack parent information in first slice
             if slice_index == 0 {
                 data[0..8].copy_from_slice(&parent_slot.to_be_bytes());
@@ -388,8 +390,8 @@ where
                 }
             }
 
-            // artificially ensure block time close to 400 ms
-            sleep(DELTA_BLOCK.saturating_sub(start_time.elapsed())).await;
+            // artificially ensure block time close to target (400ms in good conditions)
+            sleep(TARGET_BLOCK_TIME.saturating_sub(start_time.elapsed())).await;
         }
 
         Ok(())
@@ -436,6 +438,10 @@ where
             }
         }
         Ok(())
+    }
+
+    pub fn blockstore(&self) -> std::sync::Arc<tokio::sync::RwLock<crate::consensus::Blockstore>> {
+        std::sync::Arc::clone(&self.blockstore)
     }
 }
 

@@ -427,6 +427,10 @@ impl Pool {
             .entry(slot)
             .or_insert_with(|| SlotState::new(slot, Arc::clone(&self.epoch_info)))
     }
+
+    pub fn slot_states_len(&self) -> usize {
+        self.slot_states.len()
+    }
 }
 
 #[cfg(test)]

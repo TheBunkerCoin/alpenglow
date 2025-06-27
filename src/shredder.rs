@@ -29,12 +29,12 @@ use crate::crypto::signature::{PublicKey, SecretKey, Signature};
 use crate::crypto::{Hash, MerkleTree, hash};
 
 /// Number of data shreds the payload of a slice is split into.
-pub const DATA_SHREDS: usize = 32;
+pub const DATA_SHREDS: usize = 4;
 /// Total number of shreds the shredder outputs for a slice.
 ///
 /// Generally, includes both data and coding shreds.
 /// How many are data and coding depends on the specific shredder.
-pub const TOTAL_SHREDS: usize = 64;
+pub const TOTAL_SHREDS: usize = 6;
 /// Maximum number of payload bytes a single shred can hold.
 pub const MAX_DATA_PER_SHRED: usize = 1024;
 /// Maximum number of payload bytes an entire slice can hold.

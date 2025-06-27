@@ -42,6 +42,24 @@ pub struct Block {
     transactions: Vec<Transaction>,
 }
 
+impl Block {
+    pub fn parent(&self) -> Slot {
+        self.parent
+    }
+
+    pub fn parent_hash(&self) -> Hash {
+        self.parent_hash
+    }
+
+    pub fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    pub fn block_hash(&self) -> Hash {
+        self.block_hash
+    }
+}
+
 /// Dummy transaction containing payload bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transaction(Vec<u8>);

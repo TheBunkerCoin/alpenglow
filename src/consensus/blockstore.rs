@@ -306,6 +306,13 @@ impl Blockstore {
         let tree = self.double_merkle_trees.get(&slot).unwrap();
         tree.create_proof(slice)
     }
+
+    pub fn blocks_len(&self) -> usize {
+        self.blocks.len()
+    }
+    pub fn shreds_len(&self) -> usize {
+        self.shreds.len()
+    }
 }
 
 #[cfg(test)]

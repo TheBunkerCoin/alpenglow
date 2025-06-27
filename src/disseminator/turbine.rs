@@ -21,9 +21,8 @@ use crate::{Slot, ValidatorId, ValidatorInfo};
 use super::Disseminator;
 
 pub(crate) use weighted_shuffle::WeightedShuffle;
-
-/// Default fanout for the Turbine tree.
-pub const DEFAULT_FANOUT: usize = 200;
+/// 2 for bandwidth-constrained HF radio.
+pub const DEFAULT_FANOUT: usize = 2;
 
 /// Maximum number of different Turbine trees cached.
 ///
