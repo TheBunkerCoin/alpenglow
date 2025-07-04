@@ -53,21 +53,21 @@ pub use vote::Vote;
 use votor::Votor;
 
 /// Number of slots in each leader window.
-pub const SLOTS_PER_WINDOW: u64 = 1;
+pub const SLOTS_PER_WINDOW: u64 = 2;
 /// Number of slots in each epoch.
-pub const SLOTS_PER_EPOCH: u64 = 18_000;
+pub const SLOTS_PER_EPOCH: u64 = 4_500;
 /// Time bound assumed on network transmission delays during periods of synchrony.
-const DELTA: Duration = Duration::from_millis(10_000);
+const DELTA: Duration = Duration::from_millis(7_000);
 /// Target time for block production (slot length)
-const TARGET_BLOCK_TIME: Duration = Duration::from_millis(180_000);
+const TARGET_BLOCK_TIME: Duration = Duration::from_millis(60_000);
 /// Time the leader has for producing and sending the block.
-const DELTA_BLOCK: Duration = Duration::from_millis(360_000);
+const DELTA_BLOCK: Duration = Duration::from_millis(120_000);
 /// Timeout to use when we haven't seen any shred from the leader's block.
-const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(540_000);
+const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(180_000);
 /// Timeout to use when we have seen at least one shred from the leader's block.
-const DELTA_TIMEOUT: Duration = Duration::from_millis(720_000);
+const DELTA_TIMEOUT: Duration = Duration::from_millis(240_000);
 /// Timeout for standstill detection mechanism.
-const DELTA_STANDSTILL: Duration = Duration::from_millis(900_000);
+const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
 
 /// Alpenglow consensus protocol implementation.
 pub struct Alpenglow<A: All2All, D: Disseminator, R: Network> {

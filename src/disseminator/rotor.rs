@@ -68,12 +68,30 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
         Self { sampler, ..self }
     }
 
-    /// Sends the shred to the correct relay.
+    /// Sends the shred to the correct relay or broadcasts if on radio.
     async fn send_as_leader(&self, shred: &Shred) -> Result<(), NetworkError> {
+        #[cfg(feature = "radio_broadcast")]
+        {
+            let msg = NetworkMessage::Shred(shred.clone());
+            println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio mode)", shred.slot(), shred.index_in_slot());
+            return self.network.send(&msg, "BROADCAST").await;
+        }
+        #[cfg(not(feature = "radio_broadcast"))]
+        {
+            let type_name = std::any::type_name::<N>();
+            if type_name.contains("Radio") {
+                let msg = NetworkMessage::Shred(shred.clone());
+                println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio detected)", shred.slot(), shred.index_in_slot());
+                return self.network.send(&msg, "BROADCAST").await;
+            }
+            // fallback to relay if !radio
         let relay = self.sample_relay(shred.slot(), shred.index_in_slot());
         let msg = NetworkMessage::Shred(shred.clone());
         let v = &self.epoch_info.validator(relay);
+            println!("rotor leader sending shred slot={} index={} to relay {} at address '{}'", 
+                   shred.slot(), shred.index_in_slot(), relay, v.disseminator_address);
         self.network.send(&msg, &v.disseminator_address).await
+        }
     }
 
     /// Broadcasts a shred to all validators except for the leader and itself.
@@ -87,17 +105,14 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
             return Ok(());
         }
 
-        // otherwise, broadcast
+        log::info!("rotor relay {} broadcasting shred slot={} index={} to BROADCAST", 
+                   self.epoch_info.own_id, shred.slot(), shred.index_in_slot());
+
         let msg = NetworkMessage::Shred(shred.clone());
-        let bytes = msg.to_bytes();
-        for v in &self.epoch_info.validators {
-            if v.id == leader || v.id == relay {
-                continue;
-            }
-            self.network
-                .send_serialized(&bytes, &v.disseminator_address)
-                .await?;
-        }
+        
+        self.network.send(&msg, "BROADCAST").await?;
+        
+        
         Ok(())
     }
 
