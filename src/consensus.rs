@@ -46,18 +46,19 @@ use crate::shredder;
 use crate::{All2All, Disseminator, Slot, ValidatorInfo};
 
 pub use blockstore::{BlockInfo, Blockstore};
+pub use blockstore::BlockMetadata;
 pub use cert::Cert;
 pub use epoch_info::EpochInfo;
 pub use pool::{Pool, PoolError};
 pub use vote::Vote;
-use votor::Votor;
+use votor::{Votor, VotorEvent};
 
 /// Number of slots in each leader window.
 pub const SLOTS_PER_WINDOW: u64 = 2;
 /// Number of slots in each epoch.
 pub const SLOTS_PER_EPOCH: u64 = 4_500;
 /// Time bound assumed on network transmission delays during periods of synchrony.
-const DELTA: Duration = Duration::from_millis(7_000);
+const DELTA: Duration = Duration::from_millis(8_000);
 /// Target time for block production (slot length)
 const TARGET_BLOCK_TIME: Duration = Duration::from_millis(60_000);
 /// Time the leader has for producing and sending the block.
@@ -68,6 +69,8 @@ const DELTA_EARLY_TIMEOUT: Duration = Duration::from_millis(180_000);
 const DELTA_TIMEOUT: Duration = Duration::from_millis(240_000);
 /// Timeout for standstill detection mechanism.
 const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
+
+
 
 /// Alpenglow consensus protocol implementation.
 pub struct Alpenglow<A: All2All, D: Disseminator, R: Network> {
@@ -118,7 +121,8 @@ where
 
         let blockstore = Blockstore::new(epoch_info.clone(), votor_tx.clone());
         let blockstore = Arc::new(RwLock::new(blockstore));
-        let pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
+        let mut pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
+        pool.set_blockstore(Arc::clone(&blockstore));
         let pool = Arc::new(RwLock::new(pool));
         let repair = Repair::new(
             Arc::clone(&blockstore),
@@ -172,6 +176,17 @@ where
     /// Returns an error only if any of the tasks panics.
     #[fastrace::trace(short_name = true)]
     pub async fn run(self) -> Result<()> {
+        // clean load after startup
+        {
+            let pool_guard = self.pool.read().await;
+            let highest_finalized = pool_guard.finalized_slot();
+            drop(pool_guard);
+            
+            let mut blockstore_guard = self.blockstore.write().await;
+            blockstore_guard.clean_beyond_finalized(highest_finalized);
+            drop(blockstore_guard);
+        }
+
         let msg_loop_span = Span::enter_with_local_parent("message loop");
         let node = Arc::new(self);
         let nn = node.clone();
@@ -350,7 +365,7 @@ where
 
         for slice_index in 0..1 {
             let start_time = Instant::now();
-            let min_len = 40;
+            let min_len = 48;
             let padded_len = ((min_len + shredder::DATA_SHREDS - 1) / shredder::DATA_SHREDS) * shredder::DATA_SHREDS;
             let mut data = vec![0u8; padded_len]; // pad to next multiple of DATA_SHREDS
             // pack parent information in first slice

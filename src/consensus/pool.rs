@@ -14,17 +14,21 @@ use std::sync::Arc;
 
 use log::{debug, info, trace, warn};
 use thiserror::Error;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, RwLock};
 
 use crate::crypto::Hash;
 use crate::{Slot, ValidatorId};
 
 use super::blockstore::BlockInfo;
+use super::blockstore::Blockstore;
 use super::votor::VotorEvent;
 use super::{Cert, EpochInfo, SLOTS_PER_EPOCH, SLOTS_PER_WINDOW, Vote};
 
 use parent_ready_tracker::ParentReadyTracker;
 use slot_state::SlotState;
+
+use rocksdb::{DB, Options, IteratorMode};
+use bincode;
 
 /// Errors the Pool may throw when adding a vote or certificate.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -70,9 +74,14 @@ pub struct Pool {
     /// Information about all active validators.
     epoch_info: Arc<EpochInfo>,
     /// Channel for sending events related to voting logic to Votor.
-    votor_event_channel: Sender<VotorEvent>,
+    pub(super) votor_event_channel: Sender<VotorEvent>,
     ///
     repair_channel: Sender<(Slot, Hash)>,
+
+    /// RocksDB handle for persisting certificates & metadata.
+    db: DB,
+    /// Reference to blockstore for updating finalized timestamps.
+    blockstore: Option<Arc<RwLock<Blockstore>>>,
 }
 
 impl Pool {
@@ -84,7 +93,14 @@ impl Pool {
         votor_event_channel: Sender<VotorEvent>,
         repair_channel: Sender<(Slot, Hash)>,
     ) -> Self {
-        Self {
+        std::fs::create_dir_all("data").ok();
+        let db_path = format!("data/pool/{}", epoch_info.own_id);
+        std::fs::create_dir_all(&db_path).ok();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, db_path).expect("open RocksDB pool db");
+
+        let mut s = Self {
             slot_states: BTreeMap::new(),
             parent_ready_tracker: ParentReadyTracker::new(),
             s2n_waiting_parent_cert: BTreeMap::new(),
@@ -93,7 +109,17 @@ impl Pool {
             epoch_info,
             votor_event_channel,
             repair_channel,
-        }
+            db,
+            blockstore: None,
+        };
+
+        s.load_from_db();
+        s
+    }
+
+    /// Sets the blockstore reference for updating finalized timestamps.
+    pub fn set_blockstore(&mut self, blockstore: Arc<RwLock<Blockstore>>) {
+        self.blockstore = Some(blockstore);
     }
 
     /// Adds a new certificate to the pool. Checks validity of the certificate.
@@ -150,6 +176,18 @@ impl Pool {
     async fn add_valid_cert(&mut self, cert: Cert) {
         let slot = cert.slot();
 
+        let kind_byte: u8 = match &cert {
+            Cert::Notar(_) => 0,
+            Cert::NotarFallback(_) => 1,
+            Cert::Skip(_) => 2,
+            Cert::FastFinal(_) => 3,
+            Cert::Final(_) => 4,
+        };
+        let key = format!("cert|{:016X}|{}", cert.slot(), kind_byte);
+        if let Ok(val) = bincode::serde::encode_to_vec(&cert, bincode::config::standard()) {
+            let _ = self.db.put(key.as_bytes(), val);
+        }
+
         // actually add certificate
         trace!("adding cert to pool: {cert:?}");
         self.slot_state(slot).add_cert(cert.clone());
@@ -200,11 +238,41 @@ impl Pool {
             Cert::FastFinal(_) => {
                 info!("fast finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                
+                if let Some(ref blockstore) = self.blockstore {
+                    if let Some(hash) = cert.block_hash() {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        if let Ok(bs) = blockstore.try_read() {
+                            bs.update_finalized_timestamp(slot, hash, timestamp);
+                        }
+                    }
+                }
+                
                 self.prune();
             }
             Cert::Final(_) => {
                 info!("slow finalized slot {slot}");
                 self.highest_finalized_slot = slot.max(self.highest_finalized_slot);
+                
+                if let Some(ref blockstore) = self.blockstore {
+                    if let Some(state) = self.slot_states.get(&slot) {
+                        if let Some(ref notar_cert) = state.certificates.notar {
+                            if let Some(hash) = Cert::Notar(notar_cert.clone()).block_hash() {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_millis() as u64;
+                                if let Ok(bs) = blockstore.try_read() {
+                                    bs.update_finalized_timestamp(slot, hash, timestamp);
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 self.prune();
             }
         }
@@ -430,6 +498,128 @@ impl Pool {
 
     pub fn slot_states_len(&self) -> usize {
         self.slot_states.len()
+    }
+
+    fn load_from_db(&mut self) {
+        //println!("[Pool::load_from_db] starting reload for validator {}", self.epoch_info.own_id);
+        if let Ok(Some(val)) = self.db.get(b"meta|final_slot") {
+            if val.len() == 8 {
+                let arr: [u8;8] = val[..8].try_into().unwrap();
+                self.highest_finalized_slot = u64::from_be_bytes(arr);
+            }
+        }
+        //println!("[Pool::load_from_db] meta highest_finalized_slot = {}", self.highest_finalized_slot);
+        let mut raw_certs: Vec<Cert> = Vec::new();
+        let mut highest_nf_slot: Slot = 0;
+        let mut num_keys = 0;
+        for item in self.db.iterator(IteratorMode::Start) {
+            if let Ok((k, v)) = item {
+                num_keys += 1;
+                if k.starts_with(b"cert|") {
+                    if let Ok((cert, _)) = bincode::serde::decode_from_slice::<Cert, _>(&v, bincode::config::standard()) {
+                        match cert {
+                            Cert::FastFinal(_) | Cert::Final(_) => {
+                                self.highest_finalized_slot = self.highest_finalized_slot.max(cert.slot());
+                            }
+                            Cert::Notar(_) | Cert::NotarFallback(_) => {
+                                highest_nf_slot = highest_nf_slot.max(cert.slot());
+                            }
+                            _ => {}
+                        }
+                        raw_certs.push(cert);
+                    }
+                }
+            }
+        }
+
+        //println!("[Pool::load_from_db] found {num_keys} keys, {} certs, highest_finalized_slot = {}, highest_notar_fallback_slot = {}", raw_certs.len(), self.highest_finalized_slot, highest_nf_slot);
+
+        let retain_up_to = highest_nf_slot.max(self.highest_finalized_slot);
+
+        let certs: Vec<Cert> = raw_certs.into_iter().filter(|c| c.slot() <= retain_up_to).collect();
+        println!("[Pool::load_from_db] retaining {} certs after filter (<= slot {})", certs.len(), retain_up_to);
+
+        // remove older cert keys > highest_finalized_slot
+        for item in self.db.iterator(IteratorMode::Start) {
+            if let Ok((k, _v)) = item {
+                if k.starts_with(b"cert|") {
+                    if k.len() >= 21 { 
+                        if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
+                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
+                                if slot_val > retain_up_to {
+                                    let _ = self.db.delete(k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.parent_ready_tracker = ParentReadyTracker::new();
+        self.slot_states.clear();
+
+        for cert in certs {
+            let slot = cert.slot();
+            self.slot_state(slot).add_cert(cert.clone());
+
+            match &cert {
+                Cert::Notar(_) | Cert::NotarFallback(_) => {
+                    if let Some(hash) = cert.block_hash() {
+                        let newly = self.parent_ready_tracker.mark_notar_fallback((slot, hash));
+                        for (s, (p_slot, p_hash)) in newly {
+                            if s > self.highest_finalized_slot {
+                                let _ = self
+                                    .votor_event_channel
+                                    .try_send(VotorEvent::ParentReady { slot: s, parent_slot: p_slot, parent_hash: p_hash });
+                            }
+                        }
+                    }
+                    self.highest_notarized_fallback_slot = self.highest_notarized_fallback_slot.max(slot);
+                }
+                Cert::Skip(_) => {
+                    let newly = self.parent_ready_tracker.mark_skipped(slot);
+                    for (s, (p_slot, p_hash)) in newly {
+                        if s > self.highest_finalized_slot {
+                            let _ = self
+                                .votor_event_channel
+                                .try_send(VotorEvent::ParentReady { slot: s, parent_slot: p_slot, parent_hash: p_hash });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // persist meta|final_slot
+        let _ = self.db.put(b"meta|final_slot", self.highest_finalized_slot.to_be_bytes());
+
+        // mid window check
+        let next_slot = self.highest_finalized_slot + 1;
+        let current_window_start = (self.highest_finalized_slot / SLOTS_PER_WINDOW) * SLOTS_PER_WINDOW;
+        let current_window_end = current_window_start + SLOTS_PER_WINDOW - 1;
+        
+        // timeout if mid window
+        if self.highest_finalized_slot < current_window_end {
+            println!("[Pool::load_from_db] Mid-window restart detected, emitting timeouts for slots {}..{}", 
+                     next_slot, current_window_end);
+            for slot in next_slot..=current_window_end {
+                println!("[Pool::load_from_db] emitting Timeout for mid-window slot {}", slot);
+                let _ = self.votor_event_channel.try_send(VotorEvent::Timeout(slot));
+            }
+        } else {
+            // emit parent ready if clean window boundary cutoff
+            let next_window_start = self.highest_finalized_slot + 1;
+            if let Some((parent_slot, parent_hash)) = self.parent_ready_tracker.parents_ready(next_window_start).first() {
+                println!("[Pool::load_from_db] Clean window boundary, ParentReady already exists for slot {} (parent {}@{})", 
+                         next_window_start, &hex::encode(parent_hash)[..8], parent_slot);
+            } else {
+                println!("[Pool::load_from_db] Clean window boundary, but no ParentReady for slot {} yet", 
+                         next_window_start);
+            }
+        }
+
+        println!("[Pool::load_from_db] finished reload; highest_finalized_slot = {}, highest_notarized_fallback_slot = {}", self.highest_finalized_slot, self.highest_notarized_fallback_slot);
     }
 }
 

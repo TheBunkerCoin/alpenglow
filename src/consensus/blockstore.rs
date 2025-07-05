@@ -18,6 +18,19 @@ use crate::{Block, Slot};
 use super::epoch_info::EpochInfo;
 use super::votor::VotorEvent;
 
+use rocksdb::{DB, Options, IteratorMode};
+use serde::{Serialize, Deserialize};
+
+/// additional metadata (might need refactor @e)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockMetadata {
+    pub slot: Slot,
+    pub hash: Hash,
+    pub producer: u64,
+    pub proposed_timestamp: u64,
+    pub finalized_timestamp: Option<u64>,
+}
+
 /// Information about a block within a slot.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockInfo {
@@ -35,6 +48,9 @@ impl From<&Block> for BlockInfo {
         }
     }
 }
+
+/// blocks kept in memory at start-up
+const HOT_BLOCK_LIMIT: usize = 200;
 
 /// Blockstore is the fundamental data structure holding block data per slot.
 // TODO: extract state for each slot into struct?
@@ -62,6 +78,8 @@ pub struct Blockstore {
     epoch_info: Arc<EpochInfo>,
     /// Cache of previously verified Merkle roots.
     merkle_root_cache: HashMap<(Slot, usize), Hash>,
+    /// Persistent RocksDB handle for durable block storage.
+    db: DB,
 }
 
 impl Blockstore {
@@ -70,7 +88,17 @@ impl Blockstore {
     /// For each later reconstructed block this blockstore will send a
     /// [`VotorEvent::Block`] to the provided `votor_channel`.
     pub fn new(epoch_info: Arc<EpochInfo>, votor_channel: Sender<VotorEvent>) -> Self {
-        Self {
+        // ensure the data directory exists and open/create RocksDB database
+        std::fs::create_dir_all("data").ok();
+        let db_path = format!("data/blockstore/{}", epoch_info.own_id);
+        std::fs::create_dir_all(&db_path).ok();
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db = DB::open(&opts, db_path).expect("open RocksDB");
+
+        // initialise in-memory structures
+        let mut s = Self {
             shreds: BTreeMap::new(),
             slices: BTreeMap::new(),
             blocks: BTreeMap::new(),
@@ -82,7 +110,23 @@ impl Blockstore {
             votor_channel,
             epoch_info,
             merkle_root_cache: HashMap::new(),
+            db,
+        };
+
+        // warm cache with at most HOT_BLOCK_LIMIT most recent blocks so the node can resume quickly without having to load all into ram
+        let mut loaded = 0usize;
+        for item in s.db.iterator(IteratorMode::End) {
+            if loaded == HOT_BLOCK_LIMIT { break; }
+            if let Ok((_k, raw_val)) = item {
+                if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&raw_val, bincode::config::standard()) {
+                    s.canonical.insert(block.slot(), block.block_hash());
+                    s.blocks.insert((block.slot(), block.block_hash()), block);
+                    loaded += 1;
+                }
+            }
         }
+
+        s
     }
 
     /// Stores a new shred in the blockstore.
@@ -211,7 +255,29 @@ impl Blockstore {
             transactions: vec![],
         };
         let block_info = BlockInfo::from(&block);
-        self.blocks.insert((slot, block_hash), block);
+        self.blocks.insert((slot, block_hash), block.clone());
+
+        // persist canonical block to RocksDB for durability
+        let key = format!("{:016X}{}", slot, hex::encode(block_hash));
+        if let Ok(value) = bincode::serde::encode_to_vec(&block, bincode::config::standard()) {
+            let _ = self.db.put(key.as_bytes(), value);
+        }
+
+        // block metadata with current timestamp
+        let metadata = BlockMetadata {
+            slot,
+            hash: block_hash,
+            producer: self.epoch_info.leader(slot).id,
+            proposed_timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            finalized_timestamp: None,
+        };
+        let meta_key = format!("meta|{:016X}{}", slot, hex::encode(block_hash));
+        if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard()) {
+            let _ = self.db.put(meta_key.as_bytes(), value);
+        }
 
         // clean up raw slices
         for slice_index in 0..=*last_slice {
@@ -312,6 +378,108 @@ impl Blockstore {
     }
     pub fn shreds_len(&self) -> usize {
         self.shreds.len()
+    }
+
+    /// Fetches a block directly from RocksDB without caching it in RAM.
+    pub fn load_block_from_db(&self, slot: Slot, hash: Hash) -> Option<Block> {
+        let key = format!("{:016X}{}", slot, hex::encode(hash));
+        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
+            if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&val, bincode::config::standard()) {
+                return Some(block);
+            }
+        }
+        None
+    }
+
+    /// Searches RocksDB for a block with the given hash (slow path, should be o(n) tbd @e).
+    /// Returns slot and block if found.
+    pub fn load_block_by_hash(&self, hash: Hash) -> Option<(Slot, Block)> {
+        let suffix = hex::encode(hash);
+        let suffix_bytes = suffix.as_bytes();
+        for item in self.db.iterator(IteratorMode::Start) {
+            if let Ok((k, v)) = item {
+                if k.len() >= 16 + suffix_bytes.len() && &k[k.len()-suffix_bytes.len()..] == suffix_bytes {
+                    let slot_str = std::str::from_utf8(&k[0..16]).ok()?;
+                    let slot = u64::from_str_radix(slot_str, 16).ok()?;
+                    if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&v, bincode::config::standard()) {
+                        return Some((slot, block));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Loads block metadata from RocksDB.
+    pub fn load_block_metadata(&self, slot: Slot, hash: Hash) -> Option<BlockMetadata> {
+        let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
+        if let Ok(Some(val)) = self.db.get(key.as_bytes()) {
+            if let Ok((metadata, _)) = bincode::serde::decode_from_slice::<BlockMetadata, _>(&val, bincode::config::standard()) {
+                return Some(metadata);
+            }
+        }
+        None
+    }
+
+    /// Updates the finalized timestamp for a block.
+    pub fn update_finalized_timestamp(&self, slot: Slot, hash: Hash, timestamp: u64) {
+        if let Some(mut metadata) = self.load_block_metadata(slot, hash) {
+            metadata.finalized_timestamp = Some(timestamp);
+            let key = format!("meta|{:016X}{}", slot, hex::encode(hash));
+            if let Ok(value) = bincode::serde::encode_to_vec(&metadata, bincode::config::standard()) {
+                let _ = self.db.put(key.as_bytes(), value);
+            }
+        }
+    }
+
+    /// Loads highest finalized slot from Pool DB and prunes all blocks beyond it.
+    /// This should be called after Pool has loaded its state.
+    pub fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
+        println!("[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}", highest_finalized_slot);
+        
+        let mut deleted_count = 0;
+        let mut deleted_meta_count = 0;
+        for item in self.db.iterator(IteratorMode::Start) {
+            if let Ok((k, _v)) = item {
+                if k.starts_with(b"meta|") {
+                    if k.len() >= 21 {
+                        if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
+                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
+                                if slot_val > highest_finalized_slot {
+                                    let _ = self.db.delete(k);
+                                    deleted_meta_count += 1;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if k.len() >= 16 {
+                        if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
+                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
+                                if slot_val > highest_finalized_slot {
+                                    let _ = self.db.delete(k);
+                                    deleted_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // (redundantly) clean up in-memory structures
+        self.shreds.retain(|(slot, _), _| *slot <= highest_finalized_slot);
+        self.slices.retain(|(slot, _), _| *slot <= highest_finalized_slot);
+        self.blocks.retain(|(slot, _), _| *slot <= highest_finalized_slot);
+        self.canonical.retain(|slot, _| *slot <= highest_finalized_slot);
+        self.alternatives.retain(|slot, _| *slot <= highest_finalized_slot);
+        self.first_shred_seen.retain(|slot| *slot <= highest_finalized_slot);
+        self.double_merkle_trees.retain(|slot, _| *slot <= highest_finalized_slot);
+        self.last_slices.retain(|slot, _| *slot <= highest_finalized_slot);
+        self.merkle_root_cache.retain(|(slot, _), _| *slot <= highest_finalized_slot);
+        
+        println!("[Blockstore::clean_beyond_finalized] deleted {} blocks and {} metadata entries from DB, retained {} blocks in memory", 
+                 deleted_count, deleted_meta_count, self.blocks.len());
     }
 }
 

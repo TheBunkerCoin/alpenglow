@@ -1,8 +1,9 @@
-# Alpenglow
+# Alpenglow (BunkerCoin)
 
-Research reference implementation of the Alpenglow consensus protocol.
+Adapted version of the reference implementation of the Alpenglow consensus protocol, for the BunkerCoin Blockchain.
 
 ![Latency Histogram for Random Leaders](./latency_histogram.png)
+
 
 ## Getting Started
 

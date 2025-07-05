@@ -142,6 +142,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
     #[fastrace::trace]
     pub async fn voting_loop(&mut self) -> Result<()> {
         while let Some(event) = self.event_receiver.recv().await {
+            //println!("[Votor {}] event: {:?}", self.validator_id, event);
             if self.retired_slots.contains(&event.slot()) {
                 trace!("ignoring event for retired slot {}", event.slot());
                 continue;
@@ -167,6 +168,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
                     self.set_timeouts(slot);
                 }
                 VotorEvent::SafeToNotar(slot, hash) => {
+                    //println!("[Votor {}] SAFE_TO_NOTAR slot {}", self.validator_id, slot);
                     debug!("voted notar-fallback in slot {slot}");
                     let vote =
                         Vote::new_notar_fallback(slot, hash, &self.voting_key, self.validator_id);
@@ -175,6 +177,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
                     self.bad_window.insert(slot);
                 }
                 VotorEvent::SafeToSkip(slot) => {
+                    //println!("[Votor {}] SAFE_TO_SKIP slot {}", self.validator_id, slot);
                     debug!("voted skip-fallback in slot {slot}");
                     let vote = Vote::new_skip_fallback(slot, &self.voting_key, self.validator_id);
                     self.all2all.broadcast(&vote.into()).await.unwrap();
@@ -182,6 +185,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
                     self.bad_window.insert(slot);
                 }
                 VotorEvent::CertCreated(cert) => {
+                    //println!("[Votor {}] CERT_CREATED {:?}", self.validator_id, cert);
                     match cert.as_ref() {
                         Cert::NotarFallback(_) => {
                             self.repair_sender
@@ -203,6 +207,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
                     self.all2all.broadcast(&(*cert).into()).await.unwrap();
                 }
                 VotorEvent::Standstill(_, certs, votes) => {
+                    //println!("[Votor {}] STANDSTILL event", self.validator_id);
                     for cert in certs {
                         self.all2all.broadcast(&cert.into()).await.unwrap();
                     }
@@ -213,9 +218,11 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
 
                 // events from Blockstore
                 VotorEvent::FirstShred(slot) => {
+                    //println!("[Votor {}] FIRST_SHRED slot {}", self.validator_id, slot);
                     self.received_shred.insert(slot);
                 }
                 VotorEvent::Block { slot, block_info } => {
+                    println!("[Votor {}] BLOCK slot {} info {:?}", self.validator_id, slot, block_info);
                     if self.voted.contains(&slot) {
                         let h = &hex::encode(block_info.hash)[..8];
                         warn!("not voting for block {h} in slot {slot}, already voted");
@@ -230,12 +237,14 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
 
                 // events from Votor itself
                 VotorEvent::Timeout(slot) => {
+                    //println!("[Votor {}] TIMEOUT slot {}", self.validator_id, slot);
                     trace!("timeout for slot {slot}");
                     if !self.voted.contains(&slot) {
                         self.try_skip_window(slot).await;
                     }
                 }
                 VotorEvent::TimeoutCrashedLeader(slot) => {
+                    println!("[Votor {}] EARLY_TIMEOUT slot {}", self.validator_id, slot);
                     trace!("timeout (crashed leader) for slot {slot}");
                     if !self.received_shred.contains(&slot) && !self.voted.contains(&slot) {
                         self.try_skip_window(slot).await;
@@ -283,10 +292,10 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
                 .parents_ready
                 .contains(&(slot, parent_slot, parent_hash));
             let h = &hex::encode(parent_hash)[..8];
-            trace!(
-                "try notar slot {} with parent {} in slot {} (valid {})",
-                slot, h, parent_slot, valid_parent
-            );
+            //println!(
+            //    "[Votor {}] try_notar slot {} parent {}@{} valid={}",
+            //    self.validator_id, slot, h, parent_slot, valid_parent
+            //);
             if !valid_parent {
                 return false;
             }
@@ -295,7 +304,7 @@ impl<A: All2All + Sync + Send + 'static> Votor<A> {
         {
             return false;
         }
-        debug!("voted notar for slot {slot}");
+        //println!("[Votor {}] VOTE_NOTAR slot {} hash {}", self.validator_id, slot, &hex::encode(hash)[..8]);
         let vote = Vote::new_notar(slot, hash, &self.voting_key, self.validator_id);
         self.all2all.broadcast(&vote.into()).await.unwrap();
         self.voted.insert(slot);
