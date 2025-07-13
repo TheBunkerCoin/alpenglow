@@ -73,7 +73,7 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
         #[cfg(feature = "radio_broadcast")]
         {
             let msg = NetworkMessage::Shred(shred.clone());
-            println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio mode)", shred.payload().slot(), shred.payload().index_in_slot());
+            println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio mode)", shred.payload().slot, shred.payload().index_in_slot());
             return self.network.send(&msg, "BROADCAST").await;
         }
         #[cfg(not(feature = "radio_broadcast"))]
@@ -81,15 +81,15 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
             let type_name = std::any::type_name::<N>();
             if type_name.contains("Radio") {
                 let msg = NetworkMessage::Shred(shred.clone());
-                println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio detected)", shred.payload().slot(), shred.payload().index_in_slot());
+                println!("rotor leader broadcasting shred slot={} index={} via BROADCAST (radio detected)", shred.payload().slot, shred.payload().index_in_slot());
                 return self.network.send(&msg, "BROADCAST").await;
             }
             // fallback to relay if !radio
-        let relay = self.sample_relay(shred.payload().slot(), shred.payload().index_in_slot());
+        let relay = self.sample_relay(shred.payload().slot, shred.payload().index_in_slot());
         let msg = NetworkMessage::Shred(shred.clone());
         let v = &self.epoch_info.validator(relay);
             println!("rotor leader sending shred slot={} index={} to relay {} at address '{}'", 
-                   shred.slot(), shred.index_in_slot(), relay, v.disseminator_address);
+                   shred.payload().slot, shred.payload().index_in_slot(), relay, v.disseminator_address);
         self.network.send(&msg, &v.disseminator_address).await
         }
     }
@@ -106,7 +106,7 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
         }
 
         log::info!("rotor relay {} broadcasting shred slot={} index={} to BROADCAST", 
-                   self.epoch_info.own_id, shred.slot(), shred.index_in_slot());
+                   self.epoch_info.own_id, shred.payload().slot, shred.payload().index_in_slot());
 
         let msg = NetworkMessage::Shred(shred.clone());
         

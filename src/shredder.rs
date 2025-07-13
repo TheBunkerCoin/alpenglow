@@ -143,6 +143,18 @@ impl Shred {
         self.merkle_root_sig.verify(&self.merkle_root, pk)
     }
 
+    /// Returns the slot number this shred belongs to.
+    #[must_use]
+    pub const fn slot(&self) -> crate::Slot {
+        self.payload().slot
+    }
+
+    /// Returns the index of this shred within the entire slot.
+    #[must_use]
+    pub fn index_in_slot(&self) -> usize {
+        self.payload().index_in_slot()
+    }
+
     pub const fn payload(&self) -> &ShredPayload {
         match &self.payload_type {
             ShredPayloadType::Coding(p) | ShredPayloadType::Data(p) => &p,
@@ -172,6 +184,12 @@ impl ShredPayload {
     #[must_use]
     pub const fn index_in_slot(&self) -> usize {
         self.slice_index * DATA_SHREDS + self.index_in_slice
+    }
+
+    /// Returns the slot number this shred belongs to.
+    #[must_use]
+    pub const fn slot(&self) -> crate::Slot {
+        self.slot
     }
 }
 
