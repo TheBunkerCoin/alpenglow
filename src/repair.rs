@@ -6,7 +6,6 @@
 //!
 // WARN: this is incomplete!
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use log::{debug, trace, warn};
@@ -65,8 +64,6 @@ pub struct Repair<N: Network> {
     pool: Arc<RwLock<Pool>>,
     network: N,
     sampler: StakeWeightedSampler,
-    slice_counts: BTreeMap<(Slot, Hash), usize>,
-    slice_roots: BTreeMap<(Slot, Hash, usize), Hash>,
 }
 
 impl<N: Network> Repair<N> {
@@ -87,8 +84,6 @@ impl<N: Network> Repair<N> {
             pool,
             network,
             sampler,
-            slice_counts: BTreeMap::new(),
-            slice_roots: BTreeMap::new(),
         }
     }
 
@@ -130,7 +125,7 @@ impl<N: Network> Repair<N> {
                 let Some(shred) = blockstore.get_shred(slot, slice, shred_index) else {
                     return Ok(());
                 };
-                let root = shred.merkle_root();
+                let root = shred.merkle_root;
                 let proof = blockstore.create_double_merkle_proof(slot, slice);
                 RepairResponse::SliceRoot(request, root, proof)
             }
@@ -161,7 +156,7 @@ impl<N: Network> Repair<N> {
         let slot = response.slot();
         let block_hash = response.block_hash();
         match response {
-            RepairResponse::SliceCount(req, count) => {
+            RepairResponse::SliceCount(req, _count) => {
                 let RepairRequest::SliceCount(_, _) = req else {
                     return;
                 };
@@ -182,14 +177,16 @@ impl<N: Network> Repair<N> {
                 let RepairRequest::Shred(_, _, slice, index) = req else {
                     return;
                 };
-                if shred.slot() != slot || shred.slice() == slice || shred.index_in_slice() == index
+                if shred.payload().slot != slot
+                    || shred.payload().slice_index == slice
+                    || shred.payload().index_in_slice == index
                 {
                     return;
                 }
                 // TODO: make sure shred is checked against correct merkle_root
                 //
                 /* if !shred.merkle_root ... { return; } */
-                self.blockstore.write().await.add_shred(shred).await;
+                self.blockstore.write().await.add_shred(shred, false).await;
             }
             RepairResponse::Parent(_, parent_slot, parent_hash) => {
                 let block_info = BlockInfo {
@@ -219,12 +216,12 @@ impl<N: Network> Repair<N> {
         }
     }
 
-    async fn request_slice_count(&self, slot: Slot, hash: Hash) -> Result<(), NetworkError> {
+    async fn _request_slice_count(&self, slot: Slot, hash: Hash) -> Result<(), NetworkError> {
         let req = RepairRequest::SliceCount(slot, hash);
         self.send_request(req).await
     }
 
-    async fn request_slice_root(
+    async fn _request_slice_root(
         &self,
         slot: Slot,
         hash: Hash,
@@ -234,7 +231,7 @@ impl<N: Network> Repair<N> {
         self.send_request(req).await
     }
 
-    async fn request_shred(
+    async fn _request_shred(
         &self,
         slot: Slot,
         hash: Hash,
@@ -313,12 +310,4 @@ impl RepairResponse {
     pub const fn block_hash(&self) -> Hash {
         self.request().block_hash()
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn basic() {}
 }

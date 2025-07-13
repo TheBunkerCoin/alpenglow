@@ -22,10 +22,10 @@
 //! let ping_b2z = get_ping(berlin.id, zurich.id);
 //! ```
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::sync::LazyLock;
 
+use csv::ReaderBuilder;
 use geo::{Distance, Haversine, Point};
 use serde::Deserialize;
 
@@ -33,8 +33,10 @@ const MAX_PING_SERVERS: usize = 300;
 
 static PING_SERVERS: LazyLock<Vec<PingServer>> = LazyLock::new(|| {
     let mut output = Vec::with_capacity(MAX_PING_SERVERS);
-    let file = File::open("data/servers-2020-07-19.csv").unwrap();
-    let mut rdr = csv::Reader::from_reader(file);
+    let mut rdr = ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_path("data/servers-2020-07-19.csv")
+        .unwrap();
     for result in rdr.deserialize() {
         let record: PingServer = result.unwrap();
         output.push(record);
@@ -66,32 +68,25 @@ static PING_DATA: LazyLock<Vec<f64>> = LazyLock::new(|| {
     output
 });
 
-static COUNTRY_TO_CONTINENT: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    let file = File::open("data/countries_iso3166.csv").unwrap();
-    let mut rdr = csv::Reader::from_reader(file);
-    for result in rdr.records() {
-        let record = result.unwrap();
-        let alpha2 = record[1].to_owned();
-        let region = record[5].to_owned();
-        map.insert(alpha2, region);
-    }
-    map
-});
-
 /// A ping server from the dataset.
 #[derive(Clone, Debug, Deserialize)]
 pub struct PingServer {
     /// Server ID, to be used as `source` or `destination` in ping measurements.
     pub id: usize,
-    name: String,
-    title: String,
+    #[serde(rename = "name")]
+    _name: String,
+    #[serde(rename = "title")]
+    _title: String,
     /// City of the server.
     pub location: String,
-    state: String,
-    country: String,
-    state_abbv: String,
-    contintent: Option<u8>,
+    #[serde(rename = "state")]
+    _state: String,
+    #[serde(rename = "country")]
+    _country: String,
+    #[serde(rename = "state_abbv")]
+    _state_abbv: String,
+    #[serde(rename = "continent")]
+    _contintent: Option<u8>,
     latitude: f64,
     longitude: f64,
 }
@@ -101,11 +96,15 @@ pub struct PingServer {
 struct PingMeasurement {
     source: usize,
     destination: usize,
-    timestamp: String,
-    min: f64,
+    #[serde(rename = "timestamp")]
+    _timestamp: String,
+    #[serde(rename = "min")]
+    _min: f64,
     avg: f64,
-    max: f64,
-    mdev: f64,
+    #[serde(rename = "max")]
+    _max: f64,
+    #[serde(rename = "mdev")]
+    _mdev: f64,
 }
 
 /// Gives the coordinates for a city from the ping dataset.

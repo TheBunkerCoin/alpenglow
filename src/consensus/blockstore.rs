@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use tokio::sync::mpsc::Sender;
 
 use crate::crypto::{Hash, MerkleTree};
@@ -78,8 +78,11 @@ pub struct Blockstore {
     epoch_info: Arc<EpochInfo>,
     /// Cache of previously verified Merkle roots.
     merkle_root_cache: HashMap<(Slot, usize), Hash>,
+
     /// Persistent RocksDB handle for durable block storage.
     db: DB,
+    /// Set of slots for which conflicting shreds have been seen (leader equivocated).
+    equivocated_slots: BTreeSet<Slot>,
 }
 
 impl Blockstore {
@@ -111,6 +114,7 @@ impl Blockstore {
             epoch_info,
             merkle_root_cache: HashMap::new(),
             db,
+            equivocated_slots: BTreeSet::new(),
         };
 
         // warm cache with at most HOT_BLOCK_LIMIT most recent blocks so the node can resume quickly without having to load all into ram
@@ -131,36 +135,52 @@ impl Blockstore {
 
     /// Stores a new shred in the blockstore.
     ///
+    /// Shreds received by Rotor should set `check_equivocation` to `true`.
+    /// If `check_equivocation` is `true` and the leader was observed to equivocate,
+    /// i.e., produced conflicting blocks/slices, the shred is dropped.
+    /// 
     /// Reconstructs the corresponding slice and block if possible and necessary.
     /// If the added shred belongs to the last slice, all later shreds are deleted.
     ///
     /// Returns `Some(slot, block_info)` if a block was reconstructed, `None` otherwise.
     /// In the `Some`-case, `block_info` is the [`BlockInfo`] of the reconstructed block.
     #[fastrace::trace(short_name = true)]
-    pub async fn add_shred(&mut self, shred: Shred) -> Option<(Slot, BlockInfo)> {
-        let slot = shred.slot();
-        let slice = shred.slice();
-        let index = shred.index_in_slice();
-        let is_last_slice = shred.is_last_slice();
+    pub async fn add_shred(&mut self, shred: Shred, check_equivocation: bool) -> Option<(Slot, BlockInfo)> {
+        if check_equivocation && self.equivocated_slots.contains(&shred.payload().slot) {
+            debug!("recevied shred from equivocating leader, not adding to blockstore");
+            return None;
+        }
+        let slot = shred.payload().slot;
+        let slice = shred.payload().slice_index;
+        let index = shred.payload().index_in_slice;
+        let is_last_slice = shred.payload().is_last_slice;
         let slice_shreds = self.shreds.entry((slot, slice)).or_default();
 
         // check Merkle root and signature
         let leader_pk = &self.epoch_info.leader(slot).pubkey;
-        let merkle_root = self.merkle_root_cache.get(&(slot, slice));
-        if !shred.verify(leader_pk, merkle_root) {
-            debug!("dropping shred with invalid root");
+        let cached_merkle_root = self.merkle_root_cache.get(&(slot, slice));
+        if !shred.verify(leader_pk, cached_merkle_root) {
+            debug!("dropping invalid shred");
             return None;
-        } else if merkle_root.is_none() {
+        } else if cached_merkle_root.is_none() {
             self.merkle_root_cache
-                .insert((slot, slice), shred.merkle_root());
+                .insert((slot, slice), shred.merkle_root);
+        } else if cached_merkle_root != Some(&shred.merkle_root) {
+            if self.equivocated_slots.insert(slot) {
+                warn!("shreds show leader equivocation in slot {slot}");
+            }
+            if check_equivocation {
+                return None;
+            }
         }
 
         // store and handle this shred if and only if:
         //   - it is not yet stored in the blockstore
         //   - it is not (known to be) after the last slice
-        let exists = slice_shreds
-            .iter()
-            .any(|s| s.index_in_slice() == index && shred.is_data() == s.is_data());
+        let exists = slice_shreds.iter().any(|s| {
+            s.payload().index_in_slice == index
+                && shred.payload_type.is_data() == s.payload_type.is_data()
+        });
         let after_last = self
             .last_slices
             .get(&slot)
@@ -337,7 +357,7 @@ impl Blockstore {
     pub fn get_shred(&self, slot: Slot, slice: usize, shred: usize) -> Option<&Shred> {
         self.shreds
             .get(&(slot, slice))
-            .and_then(|v| v.iter().find(|s| s.index_in_slice() == shred))
+            .and_then(|v| v.iter().find(|s| s.payload().index_in_slice == shred))
     }
 
     /// Gives the number of stored slices for a given `slot`.
@@ -542,7 +562,7 @@ mod tests {
         // first slice is not enough
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in shreds {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_none());
         assert_eq!(blockstore.blocks.len(), 0);
@@ -550,7 +570,7 @@ mod tests {
         // after second slice we should have the block
         let shreds = RegularShredder::shred(&slices[1], &sk)?;
         for shred in shreds {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_some());
         assert_eq!(blockstore.blocks.len(), 1);
@@ -571,7 +591,7 @@ mod tests {
         // insert shreds in reverse order
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in shreds.into_iter().rev() {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_some());
 
@@ -592,21 +612,21 @@ mod tests {
         // insert just enough shreds to reconstruct slice 0 (from beginning)
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in shreds.into_iter().take(DATA_SHREDS) {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert_eq!(blockstore.stored_slices_for_slot(0), 1);
 
         // insert just enough shreds to reconstruct slice 1 (from end)
         let shreds = RegularShredder::shred(&slices[1], &sk)?;
         for shred in shreds.into_iter().skip(TOTAL_SHREDS - DATA_SHREDS) {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert_eq!(blockstore.stored_slices_for_slot(0), 2);
 
         // insert just enough shreds to reconstruct slice 2 (from middle)
         let shreds = RegularShredder::shred(&slices[2], &sk)?;
         for shred in shreds.into_iter().skip(DATA_SHREDS / 2) {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert_eq!(blockstore.stored_slices_for_slot(0), 3);
 
@@ -617,7 +637,7 @@ mod tests {
             .enumerate()
             .filter(|(i, _)| *i < DATA_SHREDS / 2 || *i >= TOTAL_SHREDS - DATA_SHREDS / 2)
         {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_some());
 
@@ -640,7 +660,7 @@ mod tests {
         // second slice alone is not enough
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in shreds {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_none());
 
@@ -650,7 +670,7 @@ mod tests {
         // after also also inserting first slice we should have the block
         let shreds = RegularShredder::shred(&slices[1], &sk)?;
         for shred in shreds {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_some());
 
@@ -670,7 +690,7 @@ mod tests {
         // insert many duplicate shreds
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in vec![shreds[0].clone(); 1024] {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
 
         // should only store one copy
@@ -689,7 +709,7 @@ mod tests {
         // insert many duplicate shreds
         let shreds = RegularShredder::shred(&slices[0], &sk)?;
         for shred in vec![shreds[0].clone(); 1024] {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
 
         // should only store one copy
@@ -712,7 +732,7 @@ mod tests {
         shreds.extend(RegularShredder::shred(&block1[0], &sk)?);
         shreds.extend(RegularShredder::shred(&block2[0], &sk)?);
         for shred in shreds {
-            blockstore.add_shred(shred).await;
+            blockstore.add_shred(shred, true).await;
         }
         assert!(blockstore.canonical_block_hash(0).is_some());
         assert!(blockstore.canonical_block_hash(1).is_some());
