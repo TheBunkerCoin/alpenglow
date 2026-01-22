@@ -22,7 +22,7 @@ use crate::shredder::{RegularShredder, Shred, ShredIndex, ShredderPool, Validate
 use crate::types::SliceIndex;
 use crate::{Block, BlockId, Slot};
 
-use rocksdb::{DB, Options, IteratorMode};
+use rocksdb::{DB, Options, IteratorMode, WriteBatch};
 use serde::{Serialize, Deserialize};
 
 /// additional metadata (might need refactor @e)
@@ -498,7 +498,8 @@ impl Blockstore for BlockstoreImpl {
     /// This should be called after Pool has loaded its state.
     pub fn clean_beyond_finalized(&mut self, highest_finalized_slot: Slot) {
         println!("[Blockstore::clean_beyond_finalized] pruning blocks beyond slot {}", highest_finalized_slot);
-        
+
+        let mut batch = WriteBatch::default();
         let mut deleted_count = 0;
         let mut deleted_meta_count = 0;
         for item in self.db.iterator(IteratorMode::Start) {
@@ -508,26 +509,25 @@ impl Blockstore for BlockstoreImpl {
                         if let Ok(slot_hex) = std::str::from_utf8(&k[5..21]) {
                             if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
                                 if slot_val > highest_finalized_slot {
-                                    let _ = self.db.delete(k);
+                                    batch.delete(&k);
                                     deleted_meta_count += 1;
                                 }
                             }
                         }
                     }
-                } else {
-                    if k.len() >= 16 {
-                        if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
-                            if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
-                                if slot_val > highest_finalized_slot {
-                                    let _ = self.db.delete(k);
-                                    deleted_count += 1;
-                                }
+                } else if k.len() >= 16 {
+                    if let Ok(slot_hex) = std::str::from_utf8(&k[0..16]) {
+                        if let Ok(slot_val) = u64::from_str_radix(slot_hex, 16) {
+                            if slot_val > highest_finalized_slot {
+                                batch.delete(&k);
+                                deleted_count += 1;
                             }
                         }
                     }
                 }
             }
         }
+        let _ = self.db.write(batch);
         
         // (redundantly) clean up in-memory structures
         self.shreds.retain(|(slot, _), _| *slot <= highest_finalized_slot);

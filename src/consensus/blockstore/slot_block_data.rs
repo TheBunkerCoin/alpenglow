@@ -361,9 +361,7 @@ impl BlockData {
         self.completed = Some((block_hash, block));
 
         // clean up raw slices
-        for slice_index in last_slice.until() {
-            self.slices.remove(&slice_index);
-        }
+        self.slices.clear();
 
         ReconstructBlockResult::Complete(block_info)
     }
