@@ -18,11 +18,11 @@
 //!
 //! # Examples
 //!
-//! ```
-//! use alpenglow::network::{NetworkError, NetworkMessage};
+//! ```rust
 //! use alpenglow::all2all::All2All;
+//! use alpenglow::consensus::ConsensusMessage;
 //!
-//! async fn broadcast_all(msgs: &[NetworkMessage], all2all: impl All2All) -> Result<(), NetworkError> {
+//! async fn broadcast_all(msgs: &[ConsensusMessage], all2all: impl All2All) -> std::io::Result<()> {
 //!     for msg in msgs {
 //!         all2all.broadcast(msg).await?;
 //!     }
@@ -35,12 +35,14 @@
 mod robust;
 mod trivial;
 
-use crate::network::{NetworkError, NetworkMessage};
+use async_trait::async_trait;
 
-pub use robust::RobustAll2All;
-pub use trivial::TrivialAll2All;
+pub use self::robust::RobustAll2All;
+pub use self::trivial::TrivialAll2All;
+use crate::consensus::ConsensusMessage;
 
 /// Abstraction for a direct all-to-all network communication protocol.
+#[async_trait]
 pub trait All2All {
     /// Broadcasts the given message to all known nodes.
     ///
@@ -50,19 +52,16 @@ pub trait All2All {
     ///
     /// # Errors
     ///
-    /// Implementors should return [`NetworkError`] iff the underlying network fails.
-    fn broadcast(
-        &self,
-        msg: &NetworkMessage,
-    ) -> impl Future<Output = Result<(), NetworkError>> + Send;
+    /// Implementors should return an [`std::io::Error`] iff the underlying network fails.
+    async fn broadcast(&self, msg: &ConsensusMessage) -> std::io::Result<()>;
 
     /// Receives a message from any of the other nodes.
     ///
-    /// Resolves to the next successfully deserialized [`NetworkMessage`].
+    /// Resolves to the next successfully deserialized [`ConsensusMessage`].
     /// Does not provide information on which node sent the message.
     ///
     /// # Errors
     ///
-    /// Implementors should return [`NetworkError`] iff the underlying network fails.
-    fn receive(&self) -> impl Future<Output = Result<NetworkMessage, NetworkError>> + Send;
+    /// Implementors should return an [`std::io::Error`] iff the underlying network fails.
+    async fn receive(&self) -> std::io::Result<ConsensusMessage>;
 }

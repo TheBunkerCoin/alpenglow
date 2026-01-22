@@ -3,11 +3,12 @@
 
 use alpenglow::crypto::signature::SecretKey;
 use alpenglow::shredder::{
-    AontShredder, CodingOnlyShredder, DATA_SHREDS, PetsShredder, RegularShredder, Shred, Shredder,
-    Slice,
+    AontShredder, CodingOnlyShredder, DATA_SHREDS, PetsShredder, RegularShredder, Shredder,
+    TOTAL_SHREDS, ValidatedShred,
 };
+use alpenglow::types::Slice;
+use alpenglow::types::slice::create_slice_with_invalid_txs;
 use divan::counter::BytesCount;
-use rand::prelude::*;
 
 fn main() {
     divan::main();
@@ -20,21 +21,14 @@ fn shred<S: Shredder>(bencher: divan::Bencher) {
     bencher
         .counter(BytesCount::new(size))
         .with_inputs(|| {
+            let slice = create_slice_with_invalid_txs(size);
             let mut rng = rand::rng();
-            let mut slice_data = vec![0; size];
-            rng.fill_bytes(&mut slice_data);
-            let slice = Slice {
-                slot: 0,
-                slice_index: 0,
-                is_last: true,
-                merkle_root: None,
-                data: slice_data,
-            };
             let sk = SecretKey::new(&mut rng);
-            (slice, sk)
+            let shredder = S::default();
+            (shredder, slice, sk)
         })
-        .bench_values(|(slice, sk): (Slice, SecretKey)| {
-            let _ = S::shred(&slice, &sk).unwrap();
+        .bench_values(|(mut shredder, slice, sk): (S, Slice, SecretKey)| {
+            let _ = shredder.shred(slice, &sk).unwrap();
         });
 }
 
@@ -45,20 +39,21 @@ fn deshred<S: Shredder>(bencher: divan::Bencher) {
     bencher
         .counter(BytesCount::new(size))
         .with_inputs(|| {
+            let slice = create_slice_with_invalid_txs(size);
             let mut rng = rand::rng();
-            let mut slice_data = vec![0; size];
-            rng.fill_bytes(&mut slice_data);
-            let slice = Slice {
-                slot: 0,
-                slice_index: 0,
-                is_last: true,
-                merkle_root: None,
-                data: slice_data,
-            };
             let sk = SecretKey::new(&mut rng);
-            S::shred(&slice, &sk).unwrap()
+            let mut shredder = S::default();
+            let mut shreds = shredder.shred(slice, &sk).unwrap().map(Some);
+            // need at least DATA_SHREDS to reconstruct and want to include as many coding shreds as possible which should be at the end of the array
+            // so mark the first TOTAL_SHREDS - DATA_SHREDS as None
+            for shred in shreds.iter_mut().take(TOTAL_SHREDS - DATA_SHREDS) {
+                *shred = None;
+            }
+            (shredder, shreds)
         })
-        .bench_values(|shreds: Vec<Shred>| {
-            let _ = S::deshred(&shreds[DATA_SHREDS..]).unwrap();
-        });
+        .bench_values(
+            |(mut shredder, shreds): (S, [Option<ValidatedShred>; TOTAL_SHREDS])| {
+                let _ = shredder.deshred(&shreds).unwrap();
+            },
+        );
 }

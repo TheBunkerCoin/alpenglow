@@ -10,11 +10,13 @@
 
 mod weighted_shuffle;
 
-use log::warn;
+use async_trait::async_trait;
 use moka::future::Cache;
 use rand::prelude::*;
 
-use crate::network::{Network, NetworkError, NetworkMessage};
+pub(crate) use self::weighted_shuffle::WeightedShuffle;
+use super::Disseminator;
+use crate::network::{Network, ShredNetwork};
 use crate::shredder::Shred;
 use crate::{Slot, ValidatorId, ValidatorInfo};
 
@@ -46,11 +48,15 @@ pub struct Turbine<N: Network> {
 #[derive(Clone, Debug)]
 pub(crate) struct TurbineTree {
     root: ValidatorId,
+    #[allow(dead_code)]
     parent: Option<ValidatorId>,
     children: Vec<ValidatorId>,
 }
 
-impl<N: Network> Turbine<N> {
+impl<N> Turbine<N>
+where
+    N: ShredNetwork,
+{
     /// Creates a new Turbine instance, configured with the default fanout.
     pub fn new(validator_id: ValidatorId, validators: Vec<ValidatorInfo>, network: N) -> Self {
         Self {
@@ -81,15 +87,13 @@ impl<N: Network> Turbine<N> {
     /// # Errors
     ///
     /// Returns an error if the send operation on the underlying network fails.
-    pub async fn send_shred_to_root(&self, shred: &Shred) -> Result<(), NetworkError> {
-        // TODO: fix duplicate use indices between data and coding shreds
+    pub async fn send_shred_to_root(&self, shred: &Shred) -> std::io::Result<()> {
         let tree = self
-            .get_tree(shred.payload().slot, shred.payload().index_in_slot())
+            .get_tree(shred.payload().header.slot, shred.payload().index_in_slot())
             .await;
         let root = tree.get_root();
-        let msg = NetworkMessage::Shred(shred.clone());
-        let addr = &self.validators[root as usize].disseminator_address;
-        self.network.send(&msg, &addr).await
+        let addr = self.validators[root as usize].disseminator_address;
+        self.network.send(shred, addr).await
     }
 
     /// Forwards the shred to all our children in the correct Turbine tree.
@@ -98,15 +102,15 @@ impl<N: Network> Turbine<N> {
     /// # Errors
     ///
     /// Returns an error if the send operation on the underlying network fails.
-    pub async fn forward_shred(&self, shred: &Shred) -> Result<(), NetworkError> {
+    pub async fn forward_shred(&self, shred: &Shred) -> std::io::Result<()> {
         let tree = self
-            .get_tree(shred.payload().slot, shred.payload().index_in_slot())
+            .get_tree(shred.payload().header.slot, shred.payload().index_in_slot())
             .await;
-        let msg = NetworkMessage::Shred(shred.clone());
-        for child in tree.get_children() {
-            let addr = &self.validators[*child as usize].disseminator_address;
-            self.network.send(&msg, &addr).await?;
-        }
+        let addrs = tree
+            .get_children()
+            .iter()
+            .map(|child| self.validators[*child as usize].disseminator_address);
+        self.network.send_to_many(shred, addrs).await?;
         Ok(())
     }
 
@@ -128,22 +132,21 @@ impl<N: Network> Turbine<N> {
     }
 }
 
-impl<N: Network> Disseminator for Turbine<N> {
-    async fn send(&self, shred: &Shred) -> Result<(), NetworkError> {
+#[async_trait]
+impl<N> Disseminator for Turbine<N>
+where
+    N: ShredNetwork,
+{
+    async fn send(&self, shred: &Shred) -> std::io::Result<()> {
         self.send_shred_to_root(shred).await
     }
 
-    async fn forward(&self, shred: &Shred) -> Result<(), NetworkError> {
+    async fn forward(&self, shred: &Shred) -> std::io::Result<()> {
         self.forward_shred(shred).await
     }
 
-    async fn receive(&self) -> Result<Shred, NetworkError> {
-        loop {
-            match self.network.receive().await? {
-                NetworkMessage::Shred(s) => return Ok(s),
-                m => warn!("unexpected message type for Turbine: {:?}", m),
-            }
-        }
+    async fn receive(&self) -> std::io::Result<Shred> {
+        self.network.receive().await
     }
 }
 
@@ -162,7 +165,7 @@ impl TurbineTree {
         // seed the RNG
         let seed = [
             b"ALPENGLOWTURBINE",
-            &slot.to_be_bytes()[..],
+            &slot.inner().to_be_bytes()[..],
             &shred.to_be_bytes()[..],
         ]
         .concat();
@@ -208,6 +211,7 @@ impl TurbineTree {
 
     /// Gives the parent of this validator in the Turbine tree.
     /// Returns `None` iff this validator is the root of the tree.
+    #[allow(dead_code)]
     pub const fn get_parent(&self) -> Option<ValidatorId> {
         self.parent
     }
@@ -220,16 +224,20 @@ impl TurbineTree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::sync::Mutex;
+    use tokio::task;
+
+    use super::*;
     use crate::crypto::aggsig;
     use crate::crypto::signature::SecretKey;
-    use crate::network::UdpNetwork;
-    use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder, Slice, TOTAL_SHREDS};
-
-    use tokio::{sync::Mutex, task};
-
-    use std::{collections::HashSet, sync::Arc, time::Duration};
+    use crate::network::simulated::SimulatedNetworkCore;
+    use crate::network::{SimulatedNetwork, dontcare_sockaddr, localhost_ip_sockaddr};
+    use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder, TOTAL_SHREDS};
+    use crate::types::slice::create_slice_with_invalid_txs;
 
     fn create_validator_info(count: u64) -> (Vec<SecretKey>, Vec<ValidatorInfo>) {
         let mut sks = Vec::new();
@@ -243,24 +251,29 @@ mod tests {
                 stake: 1,
                 pubkey: sks[i as usize].to_pk(),
                 voting_pubkey: voting_sks[i as usize].to_pk(),
-                all2all_address: String::new(),
-                disseminator_address: String::new(),
-                repair_address: String::new(),
+                all2all_address: dontcare_sockaddr(),
+                disseminator_address: dontcare_sockaddr(),
+                repair_request_address: dontcare_sockaddr(),
+                repair_response_address: dontcare_sockaddr(),
             });
         }
         (sks, validators)
     }
 
-    fn create_turbine_instances(
+    async fn create_turbine_instances(
         validators: &mut [ValidatorInfo],
-        base_port: u16,
-    ) -> Vec<Turbine<UdpNetwork>> {
+    ) -> Vec<Turbine<SimulatedNetwork<Shred, Shred>>> {
+        let core = Arc::new(
+            SimulatedNetworkCore::default()
+                .with_jitter(0.0)
+                .with_packet_loss(0.0),
+        );
         for (i, v) in validators.iter_mut().enumerate() {
-            v.disseminator_address = format!("127.0.0.1:{}", base_port + i as u16);
+            v.disseminator_address = localhost_ip_sockaddr(i.try_into().unwrap());
         }
         let mut disseminators = Vec::new();
         for i in 0..validators.len() {
-            let network = UdpNetwork::new(base_port + i as u16);
+            let network = core.join_unlimited(i as ValidatorId).await;
             let turbine = Turbine::new(i as ValidatorId, validators.to_vec(), network);
             disseminators.push(turbine);
         }
@@ -273,7 +286,7 @@ mod tests {
         let mut trees = Vec::new();
         for v in 0..validators.len() {
             let v = v as ValidatorId;
-            let tree = TurbineTree::new(&validators, 200, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 200, v, Slot::new(0), 0);
             trees.push((v, tree));
         }
 
@@ -309,15 +322,15 @@ mod tests {
         let (_, validators) = create_validator_info(500);
         for v in 0..validators.len() {
             let v = v as ValidatorId;
-            let tree = TurbineTree::new(&validators, 200, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 200, v, Slot::new(0), 0);
             assert!(tree.get_children().len() <= 200);
-            let tree = TurbineTree::new(&validators, 1, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 1, v, Slot::new(0), 0);
             assert!(tree.get_children().len() <= 1);
-            let tree = TurbineTree::new(&validators, 2, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 2, v, Slot::new(0), 0);
             assert!(tree.get_children().len() <= 2);
-            let tree = TurbineTree::new(&validators, 400, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 400, v, Slot::new(0), 0);
             assert!(tree.get_children().len() <= 400);
-            let tree = TurbineTree::new(&validators, 1000, v, 0, 0);
+            let tree = TurbineTree::new(&validators, 1000, v, Slot::new(0), 0);
             assert!(tree.get_children().len() <= 500);
         }
     }
@@ -325,15 +338,9 @@ mod tests {
     #[tokio::test]
     async fn dissemination() {
         let (sks, mut validators) = create_validator_info(10);
-        let mut disseminators = create_turbine_instances(&mut validators, 4000);
-        let slice = Slice {
-            slot: 0,
-            slice_index: 0,
-            is_last: true,
-            merkle_root: None,
-            data: vec![42; MAX_DATA_PER_SLICE],
-        };
-        let shreds = RegularShredder::shred(&slice, &sks[0]).unwrap();
+        let mut disseminators = create_turbine_instances(&mut validators).await;
+        let slice = create_slice_with_invalid_txs(MAX_DATA_PER_SLICE);
+        let shreds = RegularShredder::default().shred(slice, &sks[0]).unwrap();
 
         let shreds_received = Arc::new(Mutex::new(0_usize));
         let mut tasks = Vec::new();
@@ -374,10 +381,11 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // wait for shreds to arrive
+        // needs to be longer than the latency of the simulated network
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // non-leaders should have received all shreds via Turbine
-        // TODO: flaky
         assert_eq!(*shreds_received.lock().await, 9 * TOTAL_SHREDS);
         task_leader.abort();
         for task in tasks {

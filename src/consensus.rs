@@ -17,26 +17,26 @@
 //! - [`Vote`] represents a vote of a specific type.
 //! - [`EpochInfo`] holds information about the epoch and all validators.
 
+mod block_producer;
 mod blockstore;
 mod cert;
 mod epoch_info;
 mod pool;
 mod vote;
-mod votor;
+pub(crate) mod votor;
 
 use std::marker::{Send, Sync};
-use std::time::Instant;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use fastrace::Span;
 use fastrace::future::FutureExt;
-use log::{debug, info, trace, warn};
-use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+use log::{trace, warn};
+use static_assertions::const_assert;
 use tokio::sync::{RwLock, mpsc};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use wincode::{SchemaRead, SchemaWrite};
 
 use crate::crypto::{Hash, aggsig, signature};
 use crate::network::{Network, NetworkError, NetworkMessage};
@@ -74,25 +74,44 @@ const DELTA_STANDSTILL: Duration = Duration::from_millis(300_000);
 
 
 
+#[derive(Clone, Debug, SchemaRead, SchemaWrite)]
+pub enum ConsensusMessage {
+    Vote(Vote),
+    Cert(Cert),
+}
+
+impl From<Vote> for ConsensusMessage {
+    fn from(vote: Vote) -> Self {
+        Self::Vote(vote)
+    }
+}
+
+impl From<Cert> for ConsensusMessage {
+    fn from(cert: Cert) -> Self {
+        Self::Cert(cert)
+    }
+}
+
 /// Alpenglow consensus protocol implementation.
-pub struct Alpenglow<A: All2All, D: Disseminator, R: Network> {
-    /// Own validator's secret key (used e.g. for block production).
-    /// This is not the same as the voting secret key, which is held by [`Votor`].
-    secret_key: signature::SecretKey,
+pub struct Alpenglow<A: All2All, D: Disseminator, T>
+where
+    T: TransactionNetwork + 'static,
+{
     /// Other validators' info.
     epoch_info: Arc<EpochInfo>,
 
     /// Blockstore for storing raw block data.
-    blockstore: Arc<RwLock<Blockstore>>,
+    blockstore: Arc<RwLock<Box<dyn Blockstore + Send + Sync>>>,
     /// Pool of votes and certificates.
-    pool: Arc<RwLock<Pool>>,
+    pool: Arc<RwLock<Box<dyn Pool + Send + Sync>>>,
+
+    /// Block production (i.e. leader side) component of the consensus protocol.
+    block_producer: Arc<BlockProducer<D, T>>,
 
     /// All-to-all broadcast network protocol for consensus messages.
     all2all: Arc<A>,
     /// Block dissemination network protocol for shreds.
     disseminator: Arc<D>,
-    /// Block repair protocol.
-    repair: Arc<Repair<R>>,
 
     /// Indicates whether the node is shutting down.
     cancel_token: CancellationToken,
@@ -100,72 +119,97 @@ pub struct Alpenglow<A: All2All, D: Disseminator, R: Network> {
     votor_handle: tokio::task::JoinHandle<()>,
 }
 
-impl<A, D, R> Alpenglow<A, D, R>
+impl<A, D, T> Alpenglow<A, D, T>
 where
-    A: All2All + Sync + Send + 'static,
-    D: Disseminator + Sync + Send + 'static,
-    R: Network + Sync + Send + 'static,
+    A: All2All + Send + Sync + 'static,
+    D: Disseminator + Send + Sync + 'static,
+    T: TransactionNetwork + 'static,
 {
     /// Creates a new Alpenglow consensus node.
+    ///
+    /// `repair_network` - [`RepairNetwork`] for sending requests and receiving responses.
+    /// `repair_request_network` - [`RepairRequestNetwork`] for answering incoming requests.
     #[must_use]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<RN, RR>(
         secret_key: signature::SecretKey,
         voting_secret_key: aggsig::SecretKey,
         all2all: A,
         disseminator: D,
-        repair_network: R,
+        repair_network: RN,
+        repair_request_network: RR,
         epoch_info: Arc<EpochInfo>,
-    ) -> Self {
+        txs_receiver: T,
+    ) -> Self
+    where
+        RR: RepairRequestNetwork + 'static,
+        RN: RepairNetwork + 'static,
+    {
         let cancel_token = CancellationToken::new();
         let (votor_tx, votor_rx) = mpsc::channel(1024);
-        let (repair_tx, mut repair_rx) = mpsc::channel(1024);
+        let (repair_tx, repair_rx) = mpsc::channel(1024);
         let all2all = Arc::new(all2all);
 
-        let blockstore = Blockstore::new(epoch_info.clone(), votor_tx.clone());
+        let blockstore: Box<dyn Blockstore + Send + Sync> =
+            Box::new(BlockstoreImpl::new(epoch_info.clone(), votor_tx.clone()));
         let blockstore = Arc::new(RwLock::new(blockstore));
         let mut pool = Pool::new(epoch_info.clone(), votor_tx.clone(), repair_tx.clone());
         pool.set_blockstore(Arc::clone(&blockstore));
         let pool = Arc::new(RwLock::new(pool));
-        let repair = Repair::new(
+
+        let repair_request_handler = RepairRequestHandler::new(
+            epoch_info.clone(),
+            blockstore.clone(),
+            repair_request_network,
+        );
+        let _repair_request_handler =
+            tokio::spawn(async move { repair_request_handler.run().await });
+
+        let mut repair = Repair::new(
             Arc::clone(&blockstore),
             Arc::clone(&pool),
             repair_network,
             epoch_info.clone(),
         );
-        let repair = Arc::new(repair);
 
-        let r = Arc::clone(&repair);
         let _repair_handle = tokio::spawn(
-            async move {
-                while let Some((slot, hash)) = repair_rx.recv().await {
-                    r.repair_block(slot, hash).await;
-                }
-            }
-            .in_span(Span::enter_with_local_parent("repair loop")),
+            async move { repair.repair_loop(repair_rx).await }
+                .in_span(Span::enter_with_local_parent("repair loop")),
         );
 
-        // let cancel = cancel_token.clone();
         let mut votor = Votor::new(
             epoch_info.own_id,
             voting_secret_key,
             votor_tx.clone(),
             votor_rx,
             all2all.clone(),
-            repair_tx,
         );
         let votor_handle = tokio::spawn(
             async move { votor.voting_loop().await.unwrap() }
                 .in_span(Span::enter_with_local_parent("voting loop")),
         );
 
-        Self {
+        let disseminator = Arc::new(disseminator);
+
+        let block_producer = Arc::new(BlockProducer::new(
             secret_key,
+            epoch_info.clone(),
+            disseminator.clone(),
+            txs_receiver,
+            blockstore.clone(),
+            pool.clone(),
+            cancel_token.clone(),
+            DELTA_BLOCK,
+            DELTA_FIRST_SLICE,
+        ));
+
+        Self {
             epoch_info,
             blockstore,
             pool,
+            block_producer,
             all2all,
-            disseminator: Arc::new(disseminator),
-            repair,
+            disseminator,
             cancel_token,
             votor_handle,
         }
@@ -200,9 +244,10 @@ where
             tokio::spawn(async move { nn.standstill_loop().await }.in_span(standstill_loop_span));
 
         let block_production_span = Span::enter_with_local_parent("block production");
-        let nn = node.clone();
+        let block_producer = Arc::clone(&node.block_producer);
         let prod_loop = tokio::spawn(
-            async move { nn.block_production_loop().await }.in_span(block_production_span),
+            async move { block_producer.block_production_loop().await }
+                .in_span(block_production_span),
         );
 
         node.cancel_token.cancelled().await;
@@ -221,7 +266,7 @@ where
         self.epoch_info.validator(self.epoch_info.own_id)
     }
 
-    pub fn get_pool(&self) -> Arc<RwLock<Pool>> {
+    pub fn get_pool(&self) -> Arc<RwLock<Box<dyn Pool + Send + Sync>>> {
         Arc::clone(&self.pool)
     }
 
@@ -233,16 +278,13 @@ where
     ///
     /// [`All2All`]: Handles incoming votes and certificates. Adds them to the [`Pool`].
     /// [`Disseminator`]: Handles incoming shreds. Adds them to the [`Blockstore`].
-    /// [`Repair`]: Answers incoming repair requests.
     async fn message_loop(self: &Arc<Self>) -> Result<()> {
         loop {
             tokio::select! {
                 // handle incoming votes and certificates
-                res = self.all2all.receive() => self.handle_all2all_message(res?).await?,
+                res = self.all2all.receive() => self.handle_all2all_message(res?).await,
                 // handle shreds received by block dissemination protocol
                 res = self.disseminator.receive() => self.handle_disseminator_shred(res?).await?,
-                // handle repair requests
-                res = self.repair.receive() => self.handle_repair_message(res?).await?,
 
                 () = self.cancel_token.cancelled() => return Ok(()),
             };
@@ -254,7 +296,7 @@ where
     /// Keeps track of when consensus progresses, i.e., [`Pool`] finalizes new blocks.
     /// Triggers standstill recovery if no progress was detected for a long time.
     async fn standstill_loop(self: &Arc<Self>) -> Result<()> {
-        let mut finalized_slot = 0;
+        let mut finalized_slot = Slot::new(0);
         let mut last_progress = Instant::now();
         loop {
             let slot = self.pool.read().await.finalized_slot();
@@ -265,7 +307,7 @@ where
                 self.pool.read().await.recover_from_standstill().await;
                 last_progress = Instant::now();
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(DELTA_BLOCK).await;
         }
     }
 
@@ -415,44 +457,45 @@ where
     }
 
     #[fastrace::trace(short_name = true)]
-    async fn handle_all2all_message(&self, msg: NetworkMessage) -> Result<(), NetworkError> {
+    async fn handle_all2all_message(&self, msg: ConsensusMessage) {
         trace!("received all2all msg: {msg:?}");
         match msg {
-            NetworkMessage::Vote(v) => match self.pool.write().await.add_vote(v).await {
+            ConsensusMessage::Vote(v) => match self.pool.write().await.add_vote(v).await {
                 Ok(()) => {}
-                Err(PoolError::Slashable(offence)) => {
+                Err(AddVoteError::Slashable(offence)) => {
                     warn!("slashable offence detected: {offence}");
                 }
                 Err(err) => trace!("ignoring invalid vote: {err}"),
             },
-            NetworkMessage::Cert(c) => match self.pool.write().await.add_cert(c).await {
+            ConsensusMessage::Cert(c) => match self.pool.write().await.add_cert(c).await {
                 Ok(()) => {}
                 Err(err) => trace!("ignoring invalid cert: {err}"),
             },
-            msg => warn!("unexpected message on all2all port: {msg:?}"),
         }
-        Ok(())
     }
 
     #[fastrace::trace(short_name = true)]
-    async fn handle_disseminator_shred(&self, shred: Shred) -> Result<(), NetworkError> {
+    async fn handle_disseminator_shred(&self, shred: Shred) -> std::io::Result<()> {
+        // potentially forward shred
         self.disseminator.forward(&shred).await?;
-        let b = self.blockstore.write().await.add_shred(shred, true).await;
-        if let Some((slot, block_info)) = b {
-            let mut guard = self.pool.write().await;
-            guard.add_block(slot, block_info).await;
-        }
-        Ok(())
-    }
 
-    async fn handle_repair_message(&self, msg: RepairMessage) -> Result<(), NetworkError> {
-        match msg {
-            RepairMessage::Request(request) => {
-                self.repair.answer_request(request).await?;
-            }
-            RepairMessage::Response(resposne) => {
-                self.repair.handle_response(resposne).await;
-            }
+        // if we are the leader, we already have the shred
+        let slot = shred.payload().header.slot;
+        if self.epoch_info.leader(slot).id == self.epoch_info.own_id {
+            return Ok(());
+        }
+
+        // otherwise, ingest into blockstore
+        let res = self
+            .blockstore
+            .write()
+            .await
+            .add_shred_from_disseminator(shred)
+            .await;
+        if let Ok(Some(block_info)) = res {
+            let mut guard = self.pool.write().await;
+            let block_id = (slot, block_info.hash);
+            guard.add_block(block_id, block_info.parent).await;
         }
         Ok(())
     }

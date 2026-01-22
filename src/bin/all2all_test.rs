@@ -2,18 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use core::f64;
-use std::sync::{Arc, atomic::AtomicUsize};
-use std::{io, time::Duration};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
-use bincode::{Decode, Encode};
+use alpenglow::logging;
 use clap::Parser;
 use color_eyre::Result;
 use log::{debug, info};
-use logforth::append;
-use logforth::filter::EnvFilter;
 use time::OffsetDateTime;
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
-use tokio::{net::UdpSocket, task::JoinSet};
+use tokio::task::JoinSet;
+use wincode::{SchemaRead, SchemaWrite};
 
 // TODO: allow for different leader per round
 const LEADER: usize = 0;
@@ -57,14 +58,14 @@ const TOTAL_NODES: usize = MACHINES * NODES_PER_MACHINE;
 const MSG_BUFFER_BYTES: usize = 1500;
 
 /// Simple program to greet a person
-#[derive(Parser, Debug)]
+#[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
     #[arg(long)]
     id: usize,
 }
 
-#[derive(Encode, Decode)]
+#[derive(SchemaRead, SchemaWrite)]
 enum Message {
     Ping(PingMsg),
     Pong(PongMsg),
@@ -72,27 +73,27 @@ enum Message {
     Vote(VoteMsg),
 }
 
-#[derive(Encode, Decode)]
+#[derive(SchemaRead, SchemaWrite)]
 struct PingMsg {
     machine: usize,
     timestamp_nanos: i128,
 }
 
-#[derive(Encode, Decode)]
+#[derive(SchemaRead, SchemaWrite)]
 struct PongMsg {
     machine: usize,
     timestamp_nanos: i128,
     timestamp_ping_nanos: i128,
 }
 
-#[derive(Encode, Decode)]
+#[derive(SchemaRead, SchemaWrite)]
 struct BlockMsg {
     machine: usize,
     timestamp_nanos: i128,
     round: usize,
 }
 
-#[derive(Encode, Decode)]
+#[derive(SchemaRead, SchemaWrite)]
 struct VoteMsg {
     machine: usize,
     timestamp_nanos: i128,
@@ -109,13 +110,7 @@ async fn main() -> Result<()> {
     // enable fancy `color_eyre` error messages
     color_eyre::install()?;
 
-    // enable `logforth` logging
-    logforth::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilter::from_default_env())
-                .append(append::Stderr::default())
-        })
-        .apply();
+    logging::enable_logforth_stderr();
 
     let machine = Machine::new(args.id);
     machine.run().await?;
@@ -132,7 +127,7 @@ impl Machine {
         Self { id }
     }
 
-    async fn run(&self) -> io::Result<()> {
+    async fn run(&self) -> std::io::Result<()> {
         let packets_received = Arc::new(AtomicUsize::new(0));
         let wc_vote_delay = Arc::new(Mutex::new(0.0));
         let sum_vote_delay = Arc::new(Mutex::new(0.0));
@@ -143,7 +138,7 @@ impl Machine {
 
         // open UDP sockets
         for node in 0..NODES_PER_MACHINE {
-            let port = BASE_PORT + node as u16;
+            let port = BASE_PORT + u16::try_from(node).unwrap();
             let addr = format!("0.0.0.0:{port}");
             let socket = Arc::new(UdpSocket::bind(&addr).await?);
             sockets.push(socket.clone());
@@ -158,15 +153,15 @@ impl Machine {
                 for id in 0..MACHINES {
                     for d_port in 0..NODES_PER_MACHINE {
                         let ip = get_machine_ip(self.id, id);
-                        let rcv_addr = format!("{}:{}", ip, BASE_PORT + d_port as u16);
+                        let port = BASE_PORT + u16::try_from(d_port).unwrap();
+                        let rcv_addr = format!("{ip}:{port}");
                         let time = OffsetDateTime::now_utc();
                         let timestamp_nanos = time.unix_timestamp_nanos();
                         let msg = Message::Ping(PingMsg {
                             machine: self.id,
                             timestamp_nanos,
                         });
-                        let bytes =
-                            bincode::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+                        let bytes = wincode::serialize(&msg).unwrap();
                         let _ = socket.send_to(&bytes, rcv_addr).await.unwrap();
                     }
                 }
@@ -184,9 +179,7 @@ impl Machine {
                 let mut buf = [0; MSG_BUFFER_BYTES];
                 loop {
                     let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-                    let (msg, _): (Message, usize) =
-                        bincode::decode_from_slice(&buf[..len], bincode::config::standard())
-                            .unwrap();
+                    let msg: Message = wincode::deserialize(&buf[..len]).unwrap();
 
                     match msg {
                         Message::Vote(vote) => {
@@ -203,7 +196,7 @@ impl Machine {
                             let block_time =
                                 OffsetDateTime::from_unix_timestamp_nanos(block_timestamp).unwrap();
                             let delay = (rcv_time - block_time).as_seconds_f64() * 1000.0;
-                            debug!("vote seen {:.1} ms after block production", delay);
+                            debug!("vote seen {delay:.1} ms after block production");
                             let mut wcvd_guard = wcvd.lock().await;
                             if delay > *wcvd_guard {
                                 *wcvd_guard = delay;
@@ -245,7 +238,7 @@ impl Machine {
                             for _ in 0..100 {
                                 for id in 0..MACHINES {
                                     for d_port in 0..NODES_PER_MACHINE {
-                                        let port = BASE_PORT + d_port as u16;
+                                        let port = BASE_PORT + u16::try_from(d_port).unwrap();
                                         let ip = get_machine_ip(self_id, id);
                                         let rcv_addr = format!("{ip}:{port}");
                                         let time = OffsetDateTime::now_utc();
@@ -269,11 +262,7 @@ impl Machine {
                                                 208, 210, 214, 217, 230, 234, 238, 241, 250,
                                             ],
                                         });
-                                        let bytes = bincode::encode_to_vec(
-                                            &msg,
-                                            bincode::config::standard(),
-                                        )
-                                        .unwrap();
+                                        let bytes = wincode::serialize(&msg).unwrap();
                                         let _ = socket.send_to(&bytes, rcv_addr).await.unwrap();
                                         debug!("vote of {len} bytes sent");
                                     }
@@ -307,12 +296,11 @@ impl Machine {
                             timestamp_nanos,
                             round,
                         });
-                        let bytes =
-                            bincode::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+                        let bytes = wincode::serialize(&msg).unwrap();
 
                         for id in 0..MACHINES {
                             for d_port in 0..NODES_PER_MACHINE {
-                                let port = BASE_PORT + d_port as u16;
+                                let port = BASE_PORT + u16::try_from(d_port).unwrap();
                                 let ip = get_machine_ip(self_id, id);
                                 let rcv_addr = format!("{ip}:{port}");
                                 debug!("sending block to {rcv_addr}");
@@ -344,9 +332,7 @@ impl Machine {
             tokio::task::spawn(async move {
                 let mut buf = [0; MSG_BUFFER_BYTES];
                 while let Ok((len, addr)) = socket.recv_from(&mut buf).await {
-                    let (msg, _): (Message, usize) =
-                        bincode::decode_from_slice(&buf[..len], bincode::config::standard())
-                            .unwrap();
+                    let msg: Message = wincode::deserialize(&buf[..len]).unwrap();
                     match msg {
                         Message::Ping(ping) => {
                             let ip = MACHINE_IPS[ping.machine];
@@ -358,9 +344,7 @@ impl Machine {
                                 timestamp_nanos,
                                 timestamp_ping_nanos: ping.timestamp_nanos,
                             });
-                            let bytes =
-                                bincode::encode_to_vec(&response, bincode::config::standard())
-                                    .unwrap();
+                            let bytes = wincode::serialize(&response).unwrap();
                             let _ = socket.send_to(&bytes, ping_addr).await.unwrap();
                         }
                         Message::Pong(pong) => {
@@ -376,8 +360,7 @@ impl Machine {
                             let p1 = (time2 - time1).as_seconds_f64() * 1000.0;
                             let p2 = (now - time2).as_seconds_f64() * 1000.0;
                             debug!(
-                                "ping of {:.1} ms ({:.2} + {:.2})observed for {}",
-                                ping_time, p1, p2, addr
+                                "ping of {ping_time:.1} ms ({p1:.2} + {p2:.2})observed for {addr}"
                             );
                             if ping_time < pings.read().await[pong.machine] {
                                 pings.write().await[pong.machine] = ping_time;
@@ -406,8 +389,7 @@ impl Machine {
                                 machine: self_id,
                                 timestamp_nanos,
                             });
-                            let bytes =
-                                bincode::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+                            let bytes = wincode::serialize(&msg).unwrap();
                             let _ = socket.send_to(&bytes, rcv_addr).await.unwrap();
                         }
                     }

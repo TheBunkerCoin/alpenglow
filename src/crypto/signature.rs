@@ -3,31 +3,35 @@
 
 //! Implementation of a digital signature scheme.
 //!
-//! This implements the Ed25519 digital signature scheme, as specified in
-//! [RFC 8032](https://tools.ietf.org/html/rfc8032).
-//! Specifically, this is a wrapper around the [`ed25519_consensus`] crate.
+//! This module abstratcs the digital signatures used throughout the entire library.
+//! Currently, it provides Ed25519 digital signature scheme, as specified in [RFC 8032].
+//! Specifically, it is a wrapper around the [`ed25519_consensus`] crate.
+//!
+//! [RFC 8032]: https://tools.ietf.org/html/rfc8032
 
 use ed25519_consensus::{SigningKey, VerificationKey};
 use rand::CryptoRng;
 use serde::{Deserialize, Serialize};
+use wincode::containers::Pod;
+use wincode::{SchemaRead, SchemaWrite};
 
-/// A secret key for the digital signature scheme.
+/// Secret key for the digital signature scheme.
 ///
 /// This is a wrapper around [`ed25519_consensus::SigningKey`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SecretKey(SigningKey);
 
-/// A public key for the digital signature scheme.
+/// Public key for the digital signature scheme.
 ///
 /// This is a wrapper around [`ed25519_consensus::VerificationKey`].
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PublicKey(VerificationKey);
 
-/// A digital signature.
+/// Digital signature.
 ///
 /// This is a wrapper around [`ed25519_consensus::Signature`].
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct Signature(ed25519_consensus::Signature);
+#[derive(Clone, Copy, Debug, SchemaRead, SchemaWrite)]
+pub struct Signature(#[wincode(with = "Pod<_>")] ed25519_consensus::Signature);
 
 impl SecretKey {
     /// Generates a new secret key.
@@ -54,14 +58,19 @@ impl SecretKey {
         let sig = self.0.sign(msg);
         Signature(sig)
     }
+
+    /// Returns the bytes of this secret key.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
 }
 
-impl AsRef<VerificationKey> for PublicKey {
-    fn as_ref(&self) -> &VerificationKey {
-        &self.0
+impl PublicKey {
+    /// Returns the bytes of this public key.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
     }
 }
 
@@ -81,6 +90,7 @@ mod tests {
     fn basic() {
         let sk = SecretKey::new(&mut rand::rng());
         let pk = sk.to_pk();
+        assert_ne!(sk.as_bytes(), pk.as_bytes());
         let msg = b"ed25519 is pretty fine";
         let sig = sk.sign(msg);
         assert!(sig.verify(msg, &pk));

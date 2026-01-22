@@ -1,26 +1,31 @@
 // Copyright (c) Anza Technology, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Implementation of Alpenglow's new Rotor block dissemination protocol.
 //!
+//! This is an evolution of Solana's original Turbine block dissemination protocol.
+//! Instead of a multi-layered tree, it always uses a single layer of relayers.
 //!
+//! Rotor can be instantiated with any quorum sampling strategy.
+//! Therefore, this module also provides multiple implementation of such.
+//! See also, the [`sampling_strategy`] module and the [`SamplingStrategy`] trait.
 //!
+//! For an implementation of Turbine, see [`crate::disseminator::turbine::Turbine`].
 
 pub mod sampling_strategy;
 
 use std::sync::Arc;
 
-use log::warn;
+use async_trait::async_trait;
 use rand::prelude::*;
-use sampling_strategy::PartitionSampler;
 
-use crate::consensus::EpochInfo;
-use crate::network::{Network, NetworkError, NetworkMessage};
-use crate::shredder::Shred;
-use crate::{Slot, ValidatorId};
-
+use self::sampling_strategy::PartitionSampler;
+pub use self::sampling_strategy::{FaitAccompli1Sampler, SamplingStrategy, StakeWeightedSampler};
 use super::Disseminator;
-
-pub use sampling_strategy::{FaitAccompli1Sampler, SamplingStrategy, StakeWeightedSampler};
+use crate::consensus::EpochInfo;
+use crate::network::{Network, ShredNetwork};
+use crate::shredder::{Shred, TOTAL_SHREDS};
+use crate::{Slot, ValidatorId};
 
 /// Rotor is a new block dissemination protocol presented together with Alpenglow.
 pub struct Rotor<N: Network, S: SamplingStrategy> {
@@ -52,7 +57,8 @@ impl<N: Network> Rotor<N, FaitAccompli1Sampler<PartitionSampler>> {
     /// Provided `network` will be used to send and receive shreds.
     pub fn new_fa1(network: N, epoch_info: Arc<EpochInfo>) -> Self {
         let validators = epoch_info.validators.clone();
-        let sampler = FaitAccompli1Sampler::new_with_partition_fallback(validators, 64);
+        let sampler =
+            FaitAccompli1Sampler::new_with_partition_fallback(validators, TOTAL_SHREDS as u64);
         Self {
             network,
             sampler,
@@ -61,7 +67,10 @@ impl<N: Network> Rotor<N, FaitAccompli1Sampler<PartitionSampler>> {
     }
 }
 
-impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
+impl<N, S: SamplingStrategy> Rotor<N, S>
+where
+    N: ShredNetwork,
+{
     /// Turns this instance into a new instance with a different sampling strategy.
     #[must_use]
     pub fn with_sampler(self, sampler: S) -> Self {
@@ -96,11 +105,11 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
 
     /// Broadcasts a shred to all validators except for the leader and itself.
     /// Does nothing if we are not the dedicated relay for this shred.
-    async fn broadcast_if_relay(&self, shred: &Shred) -> Result<(), NetworkError> {
-        let leader = self.epoch_info.leader(shred.payload().slot).id;
+    async fn broadcast_if_relay(&self, shred: &Shred) -> std::io::Result<()> {
+        let leader = self.epoch_info.leader(shred.payload().header.slot).id;
 
         // do nothing if we are not the relay
-        let relay = self.sample_relay(shred.payload().slot, shred.payload().index_in_slot());
+        let relay = self.sample_relay(shred.payload().header.slot, shred.payload().index_in_slot());
         if self.epoch_info.own_id != relay {
             return Ok(());
         }
@@ -117,54 +126,56 @@ impl<N: Network, S: SamplingStrategy> Rotor<N, S> {
     }
 
     fn sample_relay(&self, slot: Slot, shred: usize) -> ValidatorId {
-        let seed = [slot.to_be_bytes(), shred.to_be_bytes(), [0; 8], [0; 8]].concat();
+        let seed = [
+            slot.inner().to_be_bytes(),
+            shred.to_be_bytes(),
+            [0; 8],
+            [0; 8],
+        ]
+        .concat();
         let mut rng = StdRng::from_seed(seed.try_into().unwrap());
         self.sampler.sample(&mut rng)
     }
 }
 
-impl<N: Network, S: SamplingStrategy + Sync + Send + 'static> Disseminator for Rotor<N, S> {
-    async fn send(&self, shred: &Shred) -> Result<(), NetworkError> {
+#[async_trait]
+impl<N, S: SamplingStrategy + Send + Sync + 'static> Disseminator for Rotor<N, S>
+where
+    N: ShredNetwork,
+{
+    async fn send(&self, shred: &Shred) -> std::io::Result<()> {
         Self::send_as_leader(self, shred).await
     }
 
-    async fn forward(&self, shred: &Shred) -> Result<(), NetworkError> {
+    async fn forward(&self, shred: &Shred) -> std::io::Result<()> {
         Self::broadcast_if_relay(self, shred).await
     }
 
-    async fn receive(&self) -> Result<Shred, NetworkError> {
-        loop {
-            match self.network.receive().await? {
-                NetworkMessage::Shred(s) => return Ok(s),
-                m => warn!("unexpected message type for Rotor: {m:?}"),
-            }
-        }
+    async fn receive(&self) -> std::io::Result<Shred> {
+        self.network.receive().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::ValidatorInfo;
-    use crate::crypto::aggsig;
-    use crate::crypto::signature::SecretKey;
-    use crate::network::UdpNetwork;
-    use crate::shredder::{
-        MAX_DATA_PER_SLICE, RegularShredder, ShredPayloadType, Shredder, Slice, TOTAL_SHREDS,
-    };
-
-    use tokio::sync::Mutex;
-    use tokio::task;
-
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn create_rotor_instances(
-        count: u64,
-        base_port: u16,
-    ) -> (Vec<SecretKey>, Vec<Rotor<UdpNetwork, StakeWeightedSampler>>) {
+    use tokio::sync::Mutex;
+    use tokio::task;
+
+    use super::*;
+    use crate::ValidatorInfo;
+    use crate::crypto::aggsig;
+    use crate::crypto::signature::SecretKey;
+    use crate::network::{UdpNetwork, dontcare_sockaddr, localhost_ip_sockaddr};
+    use crate::shredder::{MAX_DATA_PER_SLICE, RegularShredder, Shredder, TOTAL_SHREDS};
+    use crate::types::slice::create_slice_with_invalid_txs;
+
+    type MyRotor = Rotor<UdpNetwork<Shred, Shred>, StakeWeightedSampler>;
+
+    fn create_rotor_instances(count: u64, base_port: u16) -> (Vec<SecretKey>, Vec<MyRotor>) {
         let mut sks = Vec::new();
         let mut voting_sks = Vec::new();
         let mut validators = Vec::new();
@@ -176,9 +187,10 @@ mod tests {
                 stake: 1,
                 pubkey: sks[i as usize].to_pk(),
                 voting_pubkey: voting_sks[i as usize].to_pk(),
-                all2all_address: String::new(),
-                disseminator_address: format!("127.0.0.1:{}", base_port + i as u16),
-                repair_address: String::new(),
+                all2all_address: dontcare_sockaddr(),
+                disseminator_address: localhost_ip_sockaddr(base_port + i as u16),
+                repair_request_address: dontcare_sockaddr(),
+                repair_response_address: dontcare_sockaddr(),
             });
         }
 
@@ -191,113 +203,27 @@ mod tests {
         (sks, rotors)
     }
 
-    #[tokio::test]
-    async fn two_instances() {
-        let (sks, mut rotors) = create_rotor_instances(2, 3000);
-        let slice = Slice {
-            slot: 0,
-            slice_index: 0,
-            is_last: true,
-            merkle_root: None,
-            data: vec![42; MAX_DATA_PER_SLICE],
-        };
-        let shreds = RegularShredder::shred(&slice, &sks[0]).unwrap();
+    async fn test_rotor_dissemination(count: u64, base_port: u16) {
+        let (sks, mut rotors) = create_rotor_instances(count, base_port);
+        let slice = create_slice_with_invalid_txs(MAX_DATA_PER_SLICE);
+        let shreds = RegularShredder::default().shred(slice, &sks[0]).unwrap();
 
-        let data_shreds_received = Arc::new(Mutex::new(HashSet::new()));
-        let code_shreds_received = Arc::new(Mutex::new(HashSet::new()));
-        let mut rotor_tasks = Vec::new();
-
-        // forward & receive shreds on "non-leader" Rotor instance
-        for _ in 0..rotors.len() - 1 {
-            let dsr = data_shreds_received.clone();
-            let csr = code_shreds_received.clone();
-            let rotor_non_leader = rotors.pop().unwrap();
-            rotor_tasks.push(task::spawn(async move {
-                loop {
-                    match rotor_non_leader.receive().await {
-                        Ok(shred) => {
-                            rotor_non_leader.forward(&shred).await.unwrap();
-                            let mut guard = match shred.payload_type {
-                                ShredPayloadType::Data(_) => dsr.lock().await,
-                                ShredPayloadType::Coding(_) => csr.lock().await,
-                            };
-                            assert!(!guard.contains(&shred.payload().index_in_slice));
-                            guard.insert(shred.payload().index_in_slice);
-                        }
-                        _ => continue,
-                    }
-                }
-            }));
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        for shred in shreds {
-            rotors[0].send(&shred).await.unwrap();
-        }
-
-        // forward shreds on the "leader" Rotor instance
-        assert_eq!(rotors.len(), 1);
-        let rotor_leader = rotors.pop().unwrap();
-        let rotor_task_leader = task::spawn(async move {
-            loop {
-                match rotor_leader.receive().await {
-                    Ok(shred) => {
-                        rotor_leader.forward(&shred).await.unwrap();
-                    }
-                    _ => continue,
-                }
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // non-leader should have received all shreds via Rotor
-        assert_eq!(
-            data_shreds_received.lock().await.len() + code_shreds_received.lock().await.len(),
-            TOTAL_SHREDS
-        );
-        rotor_task_leader.abort();
-        for task in rotor_tasks {
-            task.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn many_instances() {
-        let (sks, mut rotors) = create_rotor_instances(10, 3100);
-        let slice = Slice {
-            slot: 0,
-            slice_index: 0,
-            is_last: true,
-            merkle_root: None,
-            data: vec![42; MAX_DATA_PER_SLICE],
-        };
-        let shreds = RegularShredder::shred(&slice, &sks[0]).unwrap();
-
-        let mut data_shreds_received = Vec::with_capacity(rotors.len());
-        (0..rotors.len())
-            .for_each(|_| data_shreds_received.push(Arc::new(Mutex::new(HashSet::new()))));
-        let mut code_shreds_received = Vec::with_capacity(rotors.len());
-        (0..rotors.len())
-            .for_each(|_| code_shreds_received.push(Arc::new(Mutex::new(HashSet::new()))));
-        let mut rotor_tasks = Vec::new();
+        let mut shreds_received = Vec::with_capacity(rotors.len());
+        (0..rotors.len()).for_each(|_| shreds_received.push(Arc::new(Mutex::new(HashSet::new()))));
+        let mut rotor_tasks = Vec::with_capacity(rotors.len());
 
         // forward & receive shreds on "non-leader" Rotor instance
         for i in 0..rotors.len() - 1 {
-            let dsr = data_shreds_received[i].clone();
-            let csr = code_shreds_received[i].clone();
+            let shreds_received = shreds_received[i].clone();
             let rotor_non_leader = rotors.pop().unwrap();
             rotor_tasks.push(task::spawn(async move {
                 loop {
                     match rotor_non_leader.receive().await {
                         Ok(shred) => {
                             rotor_non_leader.forward(&shred).await.unwrap();
-                            let mut guard = match shred.payload_type {
-                                ShredPayloadType::Data(_) => dsr.lock().await,
-                                ShredPayloadType::Coding(_) => csr.lock().await,
-                            };
-                            assert!(!guard.contains(&shred.payload().index_in_slice));
-                            guard.insert(shred.payload().index_in_slice);
+                            let mut guard = shreds_received.lock().await;
+                            assert!(!guard.contains(&*shred.payload().shred_index));
+                            guard.insert(*shred.payload().shred_index);
                         }
                         _ => continue,
                     }
@@ -306,12 +232,13 @@ mod tests {
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(rotors.len(), 1);
         for shred in shreds {
             rotors[0].send(&shred).await.unwrap();
         }
 
         // forward shreds on the "leader" Rotor instance
-        assert_eq!(rotors.len(), 1);
         let rotor_leader = rotors.pop().unwrap();
         let rotor_task_leader = task::spawn(async move {
             loop {
@@ -327,16 +254,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // non-leader instances should have received all shreds via Rotor
-        for i in 0..9 {
-            assert_eq!(
-                data_shreds_received[i].lock().await.len()
-                    + code_shreds_received[i].lock().await.len(),
-                TOTAL_SHREDS
-            );
+        for i in 0..(count - 1) {
+            assert_eq!(shreds_received[i as usize].lock().await.len(), TOTAL_SHREDS);
         }
         rotor_task_leader.abort();
         for task in rotor_tasks {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn two_instances() {
+        test_rotor_dissemination(2, 3000).await
+    }
+
+    #[tokio::test]
+    async fn many_instances() {
+        test_rotor_dissemination(10, 3100).await
     }
 }

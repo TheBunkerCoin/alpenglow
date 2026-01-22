@@ -4,7 +4,7 @@
 //! Implementation of an aggregate signature scheme.
 //!
 //! This uses the [`blst`] implementation of BLS signatures.
-//! Specifically, it uses the BLS12-381 G2 (min sig) signature scheme.
+//! Specifically, it uses the BLS12-381 G1 (min sig) signature scheme.
 //!
 //! # Examples
 //!
@@ -25,19 +25,38 @@
 //! assert!(aggsig.verify(msg, &[pk1, pk2]));
 //! ```
 
+use std::mem::MaybeUninit;
+
 use bitvec::vec::BitVec;
 use blst::BLST_ERROR;
-use blst::min_sig::AggregateSignature as BlstAggSig;
-use blst::min_sig::PublicKey as BlstPublicKey;
-use blst::min_sig::SecretKey as BlstSecretKey;
-use blst::min_sig::Signature as BlstSignature;
+use blst::min_sig::{
+    AggregateSignature as BlstAggSig, PublicKey as BlstPublicKey, SecretKey as BlstSecretKey,
+    Signature as BlstSignature,
+};
+use log::warn;
 use rand::prelude::*;
-use serde::Deserializer;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use static_assertions::const_assert_eq;
+use wincode::{SchemaRead, SchemaWrite};
 
 use crate::ValidatorId;
 
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
+/// Domain separator corresponding to the G1 (min sig), RO (random oracle) variant.
+const DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_";
+
+/// Size of an uncompressed BLS signature (in the `min_sig` scheme).
+///
+/// We deal with uncompressed signatures everywhere.
+/// This way signatures are twice as big as if we used compressed signatures.
+/// However, we save the time of uncompressing the signature before verifying.
+const UNCOMPRESSED_SIG_SIZE: usize = 96;
+const_assert_eq!(
+    UNCOMPRESSED_SIG_SIZE,
+    std::mem::size_of::<blst::blst_p1_affine>()
+);
+
+/// Maximum number of signers that can be aggregated into an aggregate signature.
+const MAX_SIGNERS: usize = 2048;
 
 /// A secret key for the aggregate signature scheme.
 ///
@@ -52,9 +71,16 @@ pub struct SecretKey(BlstSecretKey);
 pub struct PublicKey(BlstPublicKey);
 
 impl PublicKey {
+    /// Tries to convert a byte array into a public key.
+    ///
+    /// Returns a `BLST_ERROR` if the provided bytes are not a valid BLS public key.
     pub fn try_from_bytes(pk_in: &[u8]) -> Result<Self, BLST_ERROR> {
         Ok(Self(BlstPublicKey::from_bytes(pk_in)?))
     }
+
+    /// Tries to deserialize a `Vec<u8>` into a public key.
+    ///
+    /// This is for use with `serde(deserialize_with)`.
     pub fn from_array_of_bytes<'de, D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -62,22 +88,125 @@ impl PublicKey {
         let buf: Vec<u8> = Deserialize::deserialize(deserializer)?;
 
         Self::try_from_bytes(&buf)
-            .map_err(|e| serde::de::Error::custom(format!("BLST error {:?}", e)))
+            .map_err(|e| serde::de::Error::custom(format!("BLST error {e:?}")))
     }
 }
+
 /// An individual signature as part of the aggregate signature scheme.
 ///
 /// This is a wrapper around [`blst::min_sig::Signature`].
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct IndividualSignature(pub BlstSignature);
+//
+// NOTE: Deriving `PartialEq` and `Eq` to support testing.
+// It only makes sense beccause the underlying signature scheme happens to be deterministic and unique.
+// Reevaluate if we change the signature scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndividualSignature(BlstSignature);
+
+impl<'de> SchemaRead<'de> for IndividualSignature {
+    type Dst = IndividualSignature;
+
+    fn read(
+        reader: &mut impl wincode::io::Reader<'de>,
+        dst: &mut MaybeUninit<Self::Dst>,
+    ) -> wincode::ReadResult<()> {
+        let sig_bytes = reader.borrow_exact(UNCOMPRESSED_SIG_SIZE)?;
+        let sig = BlstSignature::deserialize(sig_bytes).map_err(|e| {
+            warn!("encountered invalid BLS sig: {e:?}");
+            wincode::ReadError::Custom("invalid BLS encoding")
+        })?;
+        dst.write(IndividualSignature(sig));
+        wincode::ReadResult::Ok(())
+    }
+}
+
+impl SchemaWrite for IndividualSignature {
+    type Src = IndividualSignature;
+
+    fn size_of(_src: &Self::Src) -> wincode::WriteResult<usize> {
+        Ok(UNCOMPRESSED_SIG_SIZE)
+    }
+
+    fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
+        Ok(writer.write(&src.0.serialize())?)
+    }
+}
 
 /// An aggregated signature that contains a bitmask of signers.
 ///
 /// This is a wrapper around [`blst::min_sig::Signature`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateSignature {
     sig: BlstSignature,
     bitmask: BitVec,
+}
+
+impl<'de> SchemaRead<'de> for AggregateSignature {
+    type Dst = AggregateSignature;
+
+    fn read(
+        reader: &mut impl wincode::io::Reader<'de>,
+        dst: &mut MaybeUninit<Self::Dst>,
+    ) -> wincode::ReadResult<()> {
+        // read raw data
+        let sig_bytes = reader.borrow_exact(UNCOMPRESSED_SIG_SIZE)?;
+        let num_bits = <usize>::get(reader)?;
+        let bitmask_raw_vec = <Vec<usize>>::get(reader)?;
+
+        // map BLS signature
+        let sig = BlstSignature::from_bytes(sig_bytes).map_err(|e| {
+            warn!("encountered invalid BLS sig: {e:?}");
+            wincode::ReadError::Custom("invalid BLS encoding")
+        })?;
+
+        // map bitmask
+        if bitmask_raw_vec.len() > MAX_SIGNERS.div_ceil(usize::BITS as usize) {
+            warn!(
+                "bitmask too long: {} bits > {} max signers",
+                bitmask_raw_vec.len() * usize::BITS as usize,
+                MAX_SIGNERS
+            );
+            return Err(wincode::ReadError::Custom("bitmask too long"));
+        }
+        if num_bits > usize::BITS as usize * bitmask_raw_vec.len() {
+            warn!(
+                "want to use too many bits: {} bits > {} bits allocated",
+                num_bits,
+                bitmask_raw_vec.len() * usize::BITS as usize,
+            );
+            return Err(wincode::ReadError::Custom("want to use too many bits"));
+        }
+        let mut bitmask =
+            BitVec::try_from_vec(bitmask_raw_vec).expect("bitmask vector should never be too big");
+
+        // the `BitVec` is now initialized with some `usize` elements
+        // we only want to use the first `num_bits` bits, as this is the intended length
+        // some last bits may be uninitialized and will be ignored by `BitVec`
+        bitmask.truncate(num_bits);
+
+        dst.write(AggregateSignature { sig, bitmask });
+        wincode::ReadResult::Ok(())
+    }
+}
+
+impl SchemaWrite for AggregateSignature {
+    type Src = AggregateSignature;
+
+    fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
+        let bitslice_num_elements = src.bitmask.as_bitslice().len();
+        // sig + num_bits + num_usizes + usize_len * num_usizes
+        Ok(UNCOMPRESSED_SIG_SIZE + 8 + 8 + 8 * bitslice_num_elements)
+    }
+
+    fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
+        writer.write(&src.sig.serialize())?;
+        <usize as SchemaWrite>::write(writer, &src.bitmask.as_bitslice().len())?;
+        let data = src.bitmask.as_bitslice().domain();
+        <usize as SchemaWrite>::write(writer, &data.len())?;
+        for elem in data {
+            <usize as SchemaWrite>::write(writer, &elem)?;
+        }
+        Ok(())
+    }
 }
 
 impl SecretKey {
@@ -93,9 +222,26 @@ impl SecretKey {
         Self(sk)
     }
 
+    /// Tries to convert a byte string into a secret key.
+    ///
+    /// Returns a `BLST_ERROR` if the provided bytes are not a valid BLS secret key.
     pub fn try_from_bytes(sk_in: &[u8]) -> Result<Self, BLST_ERROR> {
         Ok(Self(blst::min_sig::SecretKey::from_bytes(sk_in)?))
     }
+
+    /// Tries to deserialize a `Vec<u8>` into a secret key.
+    ///
+    /// This is for use with `serde(deserialize_with)`.
+    pub fn from_array_of_bytes<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let buf: Vec<u8> = Deserialize::deserialize(deserializer)?;
+
+        Self::try_from_bytes(&buf)
+            .map_err(|e| serde::de::Error::custom(format!("BLST error {e:?}")))
+    }
+
     /// Converts this secret key into the corresponding public key.
     #[must_use]
     pub fn to_pk(&self) -> PublicKey {
@@ -109,22 +255,6 @@ impl SecretKey {
     pub fn sign(&self, msg: &[u8]) -> IndividualSignature {
         let sig = self.0.sign(msg, DST, &[]);
         IndividualSignature(sig)
-    }
-
-    pub fn from_array_of_bytes<'de, D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let buf: Vec<u8> = Deserialize::deserialize(deserializer)?;
-
-        Self::try_from_bytes(&buf)
-            .map_err(|e| serde::de::Error::custom(format!("BLST error {:?}", e)))
-    }
-}
-
-impl AsRef<BlstPublicKey> for PublicKey {
-    fn as_ref(&self) -> &BlstPublicKey {
-        &self.0
     }
 }
 
@@ -170,7 +300,7 @@ impl AggregateSignature {
         if self.bitmask.len() != pks.len() {
             return false;
         }
-        let pks: Vec<_> = self.signers().map(|v| pks[v as usize].as_ref()).collect();
+        let pks: Vec<_> = self.signers().map(|v| &pks[v as usize].0).collect();
         let err = self.sig.fast_aggregate_verify(true, msg, DST, &pks);
         err == blst::BLST_ERROR::BLST_SUCCESS
     }
@@ -181,7 +311,7 @@ impl AggregateSignature {
         if self.bitmask.count_ones() != pks.len() {
             return false;
         }
-        let pks: Vec<_> = pks.iter().map(|p| p.as_ref()).collect();
+        let pks: Vec<_> = pks.iter().map(|p| &p.0).collect();
         let err = self.sig.fast_aggregate_verify(true, msg, DST, &pks);
         err == blst::BLST_ERROR::BLST_SUCCESS
     }
@@ -302,5 +432,46 @@ mod tests {
         assert!(!aggsig.verify(msg, &[pk1, pk3, pk2]));
         assert!(!aggsig.verify(msg, &[pk2, pk3, pk1]));
         assert!(!aggsig.verify(msg, &[pk3, pk1, pk2]));
+    }
+
+    #[test]
+    fn serialize_toml() {
+        #[derive(Serialize, Deserialize)]
+        struct KeyPair {
+            #[serde(deserialize_with = "SecretKey::from_array_of_bytes")]
+            sk: SecretKey,
+            #[serde(deserialize_with = "PublicKey::from_array_of_bytes")]
+            pk: PublicKey,
+        }
+
+        let sk = SecretKey::new(&mut rand::rng());
+        let pk = sk.to_pk();
+
+        // serialize and deserialize to/from TOML
+        let kp = KeyPair { sk, pk };
+        let serialized = toml::to_string(&kp).unwrap();
+        let deserialized: KeyPair = toml::from_str(&serialized).unwrap();
+        assert_eq!(kp.sk.0.to_bytes(), deserialized.sk.0.to_bytes());
+        assert_eq!(kp.pk.0.to_bytes(), deserialized.pk.0.to_bytes());
+
+        // wrong type for secret key
+        let wrong_sk_str = format!("sk = \"hello\"\npk = {:?}", kp.pk.0.to_bytes());
+        let deserialized: Result<KeyPair, toml::de::Error> = toml::from_str(&wrong_sk_str);
+        assert!(deserialized.is_err());
+
+        // invalid bytes for secret key
+        let wrong_sk_str = format!("sk = [0, 0, 0, 0]\npk = {:?}", kp.pk.0.to_bytes());
+        let deserialized: Result<KeyPair, toml::de::Error> = toml::from_str(&wrong_sk_str);
+        assert!(deserialized.is_err());
+
+        // wrong type for public key
+        let wrong_pk_str = format!("sk = {:?}\npk = \"hello\"", kp.sk.0.to_bytes());
+        let deserialized: Result<KeyPair, toml::de::Error> = toml::from_str(&wrong_pk_str);
+        assert!(deserialized.is_err());
+
+        // invalid bytes for public key
+        let wrong_pk_str = format!("sk = {:?}\npk = [0, 0, 0, 0]", kp.sk.0.to_bytes());
+        let deserialized: Result<KeyPair, toml::de::Error> = toml::from_str(&wrong_pk_str);
+        assert!(deserialized.is_err());
     }
 }

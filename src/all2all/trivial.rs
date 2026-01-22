@@ -7,10 +7,12 @@
 //! After that, the message is forgotten. The protocol is completely stateless.
 //! If the underlying [`Network`] is not reliable, the message might thus be lost.
 
-use crate::ValidatorInfo;
-use crate::network::{Network, NetworkError, NetworkMessage};
+use async_trait::async_trait;
 
 use super::All2All;
+use crate::ValidatorInfo;
+use crate::consensus::ConsensusMessage;
+use crate::network::{ConsensusNetwork, Network};
 
 /// Instance of the trivial all-to-all broadcast protocol.
 pub struct TrivialAll2All<N: Network> {
@@ -38,37 +40,43 @@ impl<N: Network> All2All for TrivialAll2All<N> {
         self.network.send(msg, "BROADCAST").await
     }
 
-    async fn receive(&self) -> Result<NetworkMessage, NetworkError> {
+    async fn receive(&self) -> std::io::Result<ConsensusMessage> {
         self.network.receive().await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::crypto::aggsig;
-    use crate::crypto::signature::SecretKey;
-    use crate::network::simulated::SimulatedNetworkCore;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use tokio::task::JoinSet;
 
-    use std::{sync::Arc, time::Duration};
+    use super::*;
+    use crate::consensus::Vote;
+    use crate::crypto::aggsig;
+    use crate::crypto::signature::SecretKey;
+    use crate::network::simulated::SimulatedNetworkCore;
+    use crate::network::{SimulatedNetwork, dontcare_sockaddr, localhost_ip_sockaddr};
+    use crate::types::Slot;
 
     #[tokio::test]
     async fn simple_broadcast() {
         // set up network and nodes
         let core = Arc::new(
-            SimulatedNetworkCore::new()
+            SimulatedNetworkCore::default()
                 .with_default_latency(Duration::from_millis(10))
                 .with_packet_loss(0.0),
         );
-        let net_sender = core.join_unlimited(0).await;
+        let net_sender: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
+            core.join_unlimited(0).await;
         let mut net_others = Vec::new();
         let mut validators = Vec::new();
         for i in 0..20 {
             if i > 0 {
-                net_others.push(core.join_unlimited(i).await);
+                let net: SimulatedNetwork<ConsensusMessage, ConsensusMessage> =
+                    core.join_unlimited(i).await;
+                net_others.push(net);
             }
             let sk = SecretKey::new(&mut rand::rng());
             let voting_sk = aggsig::SecretKey::new(&mut rand::rng());
@@ -77,9 +85,10 @@ mod tests {
                 stake: 1,
                 pubkey: sk.to_pk(),
                 voting_pubkey: voting_sk.to_pk(),
-                all2all_address: i.to_string(),
-                disseminator_address: String::new(),
-                repair_address: String::new(),
+                all2all_address: localhost_ip_sockaddr(i.try_into().unwrap()),
+                disseminator_address: dontcare_sockaddr(),
+                repair_request_address: dontcare_sockaddr(),
+                repair_response_address: dontcare_sockaddr(),
             });
         }
 
@@ -93,13 +102,15 @@ mod tests {
         // run sender and receivers
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
-            let msg = NetworkMessage::Ping;
+            let voting_sk = aggsig::SecretKey::new(&mut rand::rng());
+            let vote = Vote::new_skip(Slot::genesis(), &voting_sk, 0);
+            let msg = ConsensusMessage::Vote(vote);
             all2all_sender.broadcast(&msg).await.unwrap();
         });
         for all2all in all2all_others {
             tasks.spawn(async move {
                 let received = all2all.receive().await.unwrap();
-                assert!(matches!(received, NetworkMessage::Ping));
+                assert!(matches!(received, ConsensusMessage::Vote(_)));
             });
         }
         tasks.join_all().await;

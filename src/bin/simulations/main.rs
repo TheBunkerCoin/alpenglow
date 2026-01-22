@@ -8,7 +8,7 @@
 //! Currently three major simulations are implemented:
 //! 1. Bandwidth (Rotor, workload per node, maximum supported throughput)
 //! 2. Latency (all stages of Alpenglow)
-//! 3. Safety (Rotor, 40% crash, 20% byzantine)
+//! 3. Rotor robustness (Rotor, 40% crash, 20% byzantine)
 //!
 //! For parallelization of these simulations, [`rayon`] is used in most places.
 //!
@@ -26,44 +26,56 @@
 //! - Decaying acceptance (with 3.0 max samples)
 //! - Turbine
 //!
-//! The global constants [`RUN_BANDWIDTH_TESTS`], [`RUN_LATENCY_TESTS`],
-//! [`RUN_CRASH_SAFETY_TESTS`], and [`RUN_BYZANTINE_SAFETY_TESTS`]
-//! control which tests to run.
+//! The global constants [`RUN_BANDWIDTH_TESTS`], [`RUN_LATENCY_TESTS`], and
+//! [`RUN_ROTOR_ROBUSTNESS_TESTS`] control which tests to run.
 //! Further, the global constants [`SAMPLING_STRATEGIES`], [`MAX_BANDWIDTHS`],
 //! and [`SHRED_COMBINATIONS`] control the parameters for some tests.
 
-mod bandwidth;
-mod latency;
-mod rotor_safety;
+#![deny(rustdoc::broken_intra_doc_links)]
 
+mod alpenglow;
+mod discrete_event_simulator;
+mod pyjama;
+mod quorum_robustness;
+mod rotor;
+mod ryse;
+
+use std::cmp::Reverse;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use alpenglow::ValidatorInfo;
-use alpenglow::disseminator::rotor::sampling_strategy::{
-    DecayingAcceptanceSampler, FaitAccompli1Sampler, FaitAccompli2Sampler, TurbineSampler,
-    UniformSampler,
+use ::alpenglow::disseminator::rotor::sampling_strategy::{
+    AllSameSampler, DecayingAcceptanceSampler, FaitAccompli1Sampler, FaitAccompli2Sampler,
+    TurbineSampler, UniformSampler,
 };
-use alpenglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
-use alpenglow::network::simulated::ping_data::PingServer;
-use alpenglow::network::simulated::stake_distribution::{
+use ::alpenglow::disseminator::rotor::{SamplingStrategy, StakeWeightedSampler};
+use ::alpenglow::network::simulated::ping_data::PingServer;
+use ::alpenglow::network::simulated::stake_distribution::{
     VALIDATOR_DATA, ValidatorData, validators_from_validator_data,
 };
+use ::alpenglow::{Stake, ValidatorId, ValidatorInfo, logging};
 use color_eyre::Result;
 use log::info;
-use logforth::append;
-use logforth::filter::EnvFilter;
 use rayon::prelude::*;
 
-use bandwidth::BandwidthTest;
-use latency::{LatencyTest, LatencyTestStage};
-use rotor_safety::RotorSafetyTest;
+use crate::alpenglow::{
+    AlpenglowLatencySimulation, BandwidthTest, LatencySimInstanceBuilder, LatencySimParams,
+};
+use crate::discrete_event_simulator::{SimulationEngine, SimulationEnvironment};
+use crate::pyjama::{
+    PyjamaInstanceBuilder, PyjamaLatencySimulation, PyjamaParams, run_pyjama_robustness_test,
+};
+use crate::rotor::{
+    RotorInstanceBuilder, RotorLatencySimulation, RotorParams, run_rotor_robustness_test,
+};
+use crate::ryse::{
+    RyseInstanceBuilder, RyseLatencySimulation, RyseParameters, run_ryse_robustness_test,
+};
 
 const RUN_BANDWIDTH_TESTS: bool = false;
 const RUN_LATENCY_TESTS: bool = true;
-const RUN_CRASH_SAFETY_TESTS: bool = false;
-const RUN_BYZANTINE_SAFETY_TESTS: bool = false;
+const RUN_ROTOR_ROBUSTNESS_TESTS: bool = true;
 
 const SAMPLING_STRATEGIES: [&str; 1] = [
     // "uniform",
@@ -98,13 +110,15 @@ fn main() -> Result<()> {
     // enable fancy `color_eyre` error messages
     color_eyre::install()?;
 
-    // enable `logforth` logging
-    logforth::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilter::from_default_env())
-                .append(append::Stderr::default())
-        })
-        .apply();
+    logging::enable_logforth();
+
+    crate::ryse::run_robustness_tests();
+    crate::pyjama::run_robustness_tests();
+
+    for k in [64, 128, 256, 512] {
+        run_ryse_robustness_test(k)?;
+        run_pyjama_robustness_test(k)?;
+    }
 
     if RUN_BANDWIDTH_TESTS {
         // create bandwidth evaluation files
@@ -115,9 +129,9 @@ fn main() -> Result<()> {
             .join("bandwidth_supported")
             .with_extension("csv");
         if let Some(parent) = filename.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            std::fs::create_dir_all(parent)?;
         }
-        let _ = File::create(filename).unwrap();
+        let _ = File::create(filename)?;
         let filename = PathBuf::from("data")
             .join("output")
             .join("simulations")
@@ -125,27 +139,27 @@ fn main() -> Result<()> {
             .join("bandwidth_usage")
             .with_extension("csv");
         if let Some(parent) = filename.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            std::fs::create_dir_all(parent)?;
         }
-        let _ = File::create(filename).unwrap();
+        let _ = File::create(filename)?;
     }
 
-    if RUN_CRASH_SAFETY_TESTS || RUN_BYZANTINE_SAFETY_TESTS {
+    if RUN_ROTOR_ROBUSTNESS_TESTS {
         // create saftey evaluation file
         let filename = PathBuf::from("data")
             .join("output")
             .join("simulations")
-            .join("safety")
-            .join("safety")
+            .join("rotor_robustness")
+            .join("rotor_robustness")
             .with_extension("csv");
         if let Some(parent) = filename.parent() {
-            std::fs::create_dir_all(parent).unwrap();
+            std::fs::create_dir_all(parent)?;
         }
-        let _ = File::create(filename).unwrap();
+        let _ = File::create(filename)?;
     }
 
     // run tests for different stake distributions
-    run_tests_for_stake_distribution("solana", &VALIDATOR_DATA);
+    run_tests_for_stake_distribution("solana", &VALIDATOR_DATA)?;
     // run_tests_for_stake_distribution("sui", &SUI_VALIDATOR_DATA);
     // run_tests_for_stake_distribution("5hubs", &FIVE_HUBS_VALIDATOR_DATA);
     // run_tests_for_stake_distribution("stock_exchanges", &STOCK_EXCHANGES_VALIDATOR_DATA);
@@ -153,9 +167,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[ValidatorData]) {
+fn run_tests_for_stake_distribution(
+    distribution_name: &str,
+    validator_data: &[ValidatorData],
+) -> Result<()> {
     // load validator and ping data
-    let (validators, validators_and_ping_servers) = validators_from_validator_data(validator_data);
+    let (validators, mut validators_and_ping_servers) =
+        validators_from_validator_data(validator_data);
+
+    // sort by stake (from highest to lowest)
+    validators_and_ping_servers.sort_by_key(|(v, _)| Reverse(v.stake));
+    for (i, (v, _)) in validators_and_ping_servers.iter_mut().enumerate() {
+        v.id = i as ValidatorId;
+    }
+
+    // extract the validators only
     let validators_with_pings: Vec<ValidatorInfo> = validators_and_ping_servers
         .iter()
         .map(|(v, _)| v.clone())
@@ -179,7 +205,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            );
+            )?;
         } else if sampling_strat == "stake_weighted" {
             let leader_sampler = StakeWeightedSampler::new(validators.clone());
             let ping_leader_sampler = StakeWeightedSampler::new(validators_with_pings.clone());
@@ -193,7 +219,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         } else if sampling_strat == "fa1_iid" {
             let leader_sampler = StakeWeightedSampler::new(validators.clone());
             let ping_leader_sampler = StakeWeightedSampler::new(validators_with_pings.clone());
@@ -213,7 +239,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         } else if sampling_strat == "fa2" {
             let leader_sampler = StakeWeightedSampler::new(validators.clone());
             let ping_leader_sampler = StakeWeightedSampler::new(validators_with_pings.clone());
@@ -228,7 +254,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         } else if sampling_strat == "fa1_partition" {
             let leader_sampler = StakeWeightedSampler::new(validators.clone());
             let ping_leader_sampler = StakeWeightedSampler::new(validators_with_pings.clone());
@@ -248,7 +274,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         } else if sampling_strat == "decaying_acceptance" {
             let leader_sampler = StakeWeightedSampler::new(validators.clone());
             let ping_leader_sampler = StakeWeightedSampler::new(validators_with_pings.clone());
@@ -263,7 +289,7 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         } else if sampling_strat == "turbine" {
             let leader_sampler = TurbineSampler::new(validators.clone());
             let ping_leader_sampler = TurbineSampler::new(validators_with_pings.clone());
@@ -277,14 +303,16 @@ fn run_tests_for_stake_distribution(distribution_name: &str, validator_data: &[V
                 &rotor_sampler,
                 &ping_leader_sampler,
                 &ping_rotor_sampler,
-            )
+            )?;
         }
     }
+
+    Ok(())
 }
 
 fn run_tests<
-    L: SamplingStrategy + Sync + Send + Clone,
-    R: SamplingStrategy + Sync + Send + Clone,
+    L: SamplingStrategy + Send + Sync + Clone,
+    R: SamplingStrategy + Send + Sync + Clone,
 >(
     test_name: &str,
     validators: &[ValidatorInfo],
@@ -293,7 +321,7 @@ fn run_tests<
     rotor_sampler: &R,
     ping_leader_sampler: &L,
     ping_rotor_sampler: &R,
-) {
+) -> Result<()> {
     if RUN_BANDWIDTH_TESTS {
         // TODO: clean up code
         let filename = PathBuf::from("data")
@@ -302,7 +330,7 @@ fn run_tests<
             .join("bandwidth")
             .join("bandwidth_supported")
             .with_extension("csv");
-        let file = File::options().append(true).open(filename).unwrap();
+        let file = File::options().append(true).open(filename)?;
         let writer = csv::Writer::from_writer(file);
         let writer = Arc::new(Mutex::new(writer));
         let supported_writer_ref = &writer;
@@ -312,7 +340,7 @@ fn run_tests<
             .join("bandwidth")
             .join("bandwidth_usage")
             .with_extension("csv");
-        let file = File::options().append(true).open(filename).unwrap();
+        let file = File::options().append(true).open(filename)?;
         let writer = csv::Writer::from_writer(file);
         let writer = Arc::new(Mutex::new(writer));
         let usage_writer_ref = &writer;
@@ -336,35 +364,116 @@ fn run_tests<
                 tester.set_num_shreds(shreds);
                 tester.reset();
                 tester.run_multiple(1_000_000);
-                tester.evaluate_supported(test_name, supported_writer_ref.clone());
+                tester.evaluate_supported(test_name, supported_writer_ref);
                 tester.evaluate_usage(test_name, usage_writer_ref.clone());
             }
         });
     }
 
     if RUN_LATENCY_TESTS {
+        let validators_with_pings = validators_with_ping_data
+            .iter()
+            .map(|(v, _)| v.clone())
+            .collect::<Vec<_>>();
+        let total_stake: Stake = validators_with_pings.iter().map(|v| v.stake).sum();
+        let leader_bandwidth = 10_000_000_000; // 10 Gbps
+        let min_bandwidth = 1_000_000_000; // 1 Gbps
+        let bandwidths = validators_with_pings
+            .iter()
+            .map(|v| {
+                ((v.stake as f64 / total_stake as f64
+                    * (validators_with_pings.len() as u64 * leader_bandwidth) as f64)
+                    .round() as u64)
+                    .max(min_bandwidth)
+            })
+            .collect();
+        let environment =
+            SimulationEnvironment::from_validators_with_ping_data(validators_with_ping_data)
+                .with_bandwidths(leader_bandwidth, bandwidths);
+
+        // Rotor
+        let params = RotorParams::new(32, 64, 40);
+        let builder = RotorInstanceBuilder::new(
+            ping_leader_sampler.clone(),
+            ping_rotor_sampler.clone(),
+            params,
+        );
+        let engine =
+            SimulationEngine::<RotorLatencySimulation<_, _>>::new(builder, environment.clone());
+        info!("rotor latency sim (sequential)");
+        engine.run_many_sequential(10);
+        engine
+            .stats()
+            .write_to_csv("data/output/rotor_10.csv", &params)?;
+        info!("rotor latency sim (parallel)");
+        engine.run_many_parallel(1000);
+        engine
+            .stats()
+            .write_to_csv("data/output/rotor_1000.csv", &params)?;
+
+        // Ryse
+        let ryse_params = RyseParameters::new(8, 320);
+        let ryse_builder = RyseInstanceBuilder::new(
+            ping_leader_sampler.clone(),
+            ping_rotor_sampler.clone(),
+            ryse_params,
+        );
+        let params = ryse::LatencySimParams::new(ryse_params, 4, 1);
+        let builder = ryse::LatencySimInstanceBuilder::new(ryse_builder, params.clone());
+        let engine =
+            SimulationEngine::<RyseLatencySimulation<_, _>>::new(builder, environment.clone());
+        info!("ryse latency sim (parallel)");
+        engine.run_many_parallel(1000);
+        engine
+            .stats()
+            .write_to_csv("data/output/ryse_1000.csv", &params)?;
+
+        // Pyjama
+        let params = PyjamaParams::new(8, 640);
+        let builder = PyjamaInstanceBuilder::new(
+            ping_leader_sampler.clone(),
+            ping_leader_sampler.clone(),
+            ping_rotor_sampler.clone(),
+            params,
+        );
+        let engine =
+            SimulationEngine::<PyjamaLatencySimulation<_, _, _>>::new(builder, environment.clone());
+        info!("pyjama latency sim (parallel)");
+        engine.run_many_parallel(1000);
+        engine
+            .stats()
+            .write_to_csv("data/output/pyjama_1000.csv", &params)?;
+
+        // Alpenglow
         // latency experiments with random leaders
         for (n, k) in SHRED_COMBINATIONS {
             info!("{test_name} latency tests (random leaders, n={n}, k={k})");
-            let tester = LatencyTest::new(
-                validators_with_ping_data,
+            let rotor_params = RotorParams::new(n, k, 40);
+            let rotor_builder = RotorInstanceBuilder::new(
                 ping_leader_sampler.clone(),
                 ping_rotor_sampler.clone(),
-                n,
-                k,
+                rotor_params,
             );
-            let test_name = format!("{test_name}-{n}-{k}");
-            tester.run_many(&test_name, 1000, LatencyTestStage::Final);
+            let params = LatencySimParams::new(rotor_params, 4, 1);
+            let builder = LatencySimInstanceBuilder::new(rotor_builder, params.clone());
+            let engine = SimulationEngine::<AlpenglowLatencySimulation<_, _>>::new(
+                builder,
+                environment.clone(),
+            );
+            engine.run_many_parallel(1000);
+            engine
+                .stats()
+                .write_to_csv("data/output/alpenglow_1000.csv", &params)?;
         }
 
         // latency experiments with fixed leaders
         let cities = if test_name.starts_with("solana") {
             vec![
-                "Westpoort",
+                "Westpoort", // Amsterdam
                 "Frankfurt",
                 "London",
-                "Zurich",
-                "New York City",
+                "Basel",
+                "Secaucus", // NYC/NJ
                 "Los Angeles",
                 "Tokyo",
                 "Singapore",
@@ -374,7 +483,7 @@ fn run_tests<
         } else if test_name.starts_with("sui") {
             vec![
                 "Los Angeles",
-                // "New Jersey",
+                "Secaucus", // NYC/NJ
                 "Dublin",
                 "London",
                 "Paris",
@@ -385,7 +494,7 @@ fn run_tests<
         } else if test_name.starts_with("5hubs") {
             vec![
                 "San Francisco",
-                "New York City",
+                "Secaucus", // NYC/NJ
                 "London",
                 "Shanghai",
                 "Tokyo",
@@ -393,7 +502,7 @@ fn run_tests<
         } else if test_name.starts_with("stock_exchanges") {
             vec![
                 "Toronto",
-                "New York City",
+                "Secaucus", // NYC/NJ
                 "Westpoort",
                 "Taipei",
                 "Pune",
@@ -405,54 +514,36 @@ fn run_tests<
             unimplemented!()
         };
 
-        for (n, k) in &SHRED_COMBINATIONS {
-            cities.par_iter().for_each(|city| {
+        for (n, k) in SHRED_COMBINATIONS {
+            cities.par_iter().try_for_each(|city| {
                 info!("{test_name} latency tests (fixed leader in {city}, n={n}, k={k})");
                 let leader = find_leader_in_city(validators_with_ping_data, city);
-                let tester = LatencyTest::new(
-                    validators_with_ping_data,
-                    ping_leader_sampler.clone(),
+                let rotor_params = RotorParams::new(n, k, 40);
+                let rotor_builder = RotorInstanceBuilder::new(
+                    AllSameSampler(leader),
                     ping_rotor_sampler.clone(),
-                    *n,
-                    *k,
+                    rotor_params,
                 );
-                let test_name = format!("{test_name}-{n}-{k}");
-                tester.run_many_with_leader(&test_name, 1000, LatencyTestStage::Final, leader);
-            });
+                let params = LatencySimParams::new(rotor_params, 4, 1);
+                let builder = LatencySimInstanceBuilder::new(rotor_builder, params.clone());
+                let engine = SimulationEngine::<AlpenglowLatencySimulation<_, _>>::new(
+                    builder,
+                    environment.clone(),
+                );
+                engine.run_many_sequential(1000);
+                let filename = format!("data/output/alpenglow_{city}_1000.csv");
+                engine.stats().write_to_csv(filename, &params)
+            })?;
         }
     }
 
-    if RUN_CRASH_SAFETY_TESTS || RUN_BYZANTINE_SAFETY_TESTS {
-        // TODO: clean up code
-        let filename = PathBuf::from("data")
-            .join("output")
-            .join("simulations")
-            .join("safety")
-            .join("safety")
-            .with_extension("csv");
-        let file = File::options().append(true).open(filename).unwrap();
-        let mut writer = csv::Writer::from_writer(file);
-
-        if RUN_CRASH_SAFETY_TESTS {
-            // safety experiments (Crash + Byz., 40%)
-            for (n, k) in &SHRED_COMBINATIONS {
-                info!("{test_name} safety test (crash=0.4, n={n}, k={k})");
-                let tester =
-                    RotorSafetyTest::new(validators.to_vec(), rotor_sampler.clone(), *n, *k);
-                tester.run(test_name, 0.4, &mut writer);
-            }
-        }
-
-        if RUN_BYZANTINE_SAFETY_TESTS {
-            // safety experiments (Byzantine only, 20%)
-            for (n, k) in &SHRED_COMBINATIONS {
-                info!("{test_name} safety test (byz=0.2, n={n}, k={k})");
-                let tester =
-                    RotorSafetyTest::new(validators.to_vec(), rotor_sampler.clone(), *n, *k);
-                tester.run(test_name, 0.2, &mut writer);
-            }
+    if RUN_ROTOR_ROBUSTNESS_TESTS {
+        for &(n, k) in &SHRED_COMBINATIONS {
+            run_rotor_robustness_test(n, k)?;
         }
     }
+
+    Ok(())
 }
 
 fn find_leader_in_city(
